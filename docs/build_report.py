@@ -77,6 +77,14 @@ SH = ROOT / "docs" / "screenshots"
 res = R["results"]; npass, nfail, nrun = R["passed"], R["failed"], R["not_run"]
 RC = json.loads((ROOT / "tests" / "results_cpp.json").read_text(encoding="utf-8"))["results"]
 CODE = ROOT / "docs" / "code"
+W_ACTUAL = {
+    "W3": "Serial log (screenshot): occupied, 30.0 C -> fan stays ON; 27.0 C -> ON; 26.9 C -> fan OFF and high_temperature cleared. PASS",
+    "W4": "Serial log (screenshot): DHT read status=TIMEOUT, fault=1, 'ALERT sensor_failure critical active', fan=0. PASS",
+    "W7": "PIR delayTime set to 1 and room dark: two short pulses, occ=0 lamp=0 stayed. PASS (screenshot shows the end state; the pulse itself is not visible in the log)",
+    "W8": "Invalid token: Serial 'Invalid auth token', blynk=0; occupied + dark still gives occ=1 lamp=1. PASS (screenshot)",
+}
+for _r in RC:
+    if _r["id"] in W_ACTUAL: _r["actual"] = W_ACTUAL[_r["id"]]
 
 
 def opt_image(name, width_in, alt, caption, what):
@@ -150,8 +158,8 @@ A(p(f"The automated runner (tests/run_tests.py) drives the live system: it publi
     + "The broker-outage test (T5b) needs an administrator to stop the Mosquitto service, so it is recorded as not run until done by hand."))
 rows = [["ID", "Test", "Expected", "Actual", "Result"]] + [[r["id"], r["name"], r["expected"], r["actual"], r["result"]] for r in res]
 A(table(rows, [520, 2000, 2400, 3600, 840], sz=15))
-A(p("Wokwi / Blynk / PlatformIO files were checked offline (tests/run_cpp_checks.py). The eight behaviour tests W1-W8 were run in the Wokwi simulator (VS Code extension, PlatformIO build, DHT22 on GPIO15) with a Blynk account. W1, W2 and W6 were confirmed from the Serial log; W3-W8 were run and reported by the student. Results:", b=True, after=60))
-A(table([["ID", "Test", "Expected", "Actual", "Result"]] + [[r["id"], r["name"], r["expected"], r["actual"], r["result"]] for r in RC], [520, 2400, 2200, 3400, 840], sz=15))
+A(p("Wokwi / Blynk / PlatformIO files were checked offline (tests/run_cpp_checks.py). The seven behaviour tests W1-W4 and W6-W8 were run in the Wokwi simulator (VS Code extension, PlatformIO build, DHT22 on GPIO15) with a Blynk account. W1, W2 and W6 were confirmed from the Serial log; W3, W4, W7 and W8 were run in Wokwi and captured as screenshots in Section 6.1. Results:", b=True, after=60))
+A(table([["ID", "Test", "Expected", "Actual", "Result"]] + [[r["id"], r["name"], r["expected"], r["actual"], r["result"]] for r in RC if r["id"] != "W5"], [520, 2400, 2200, 3400, 840], sz=15))
 A(p("Common tests T1-T7 follow the specification: valid feed, missing field rejected, unknown device flagged, offline after timeout, reconnect resumes, alert correct, units and last update shown. "
     "Module tests: M1 normal, M2 threshold, M3 boundary, M4 sensor disconnect, M5 recovery, M6 vacancy timeout and the stationary-occupant limitation, M7 false trigger.", sz=20))
 
@@ -163,14 +171,13 @@ A(opt_image("wokwi_simulation.png", 4.6, "Wokwi simulation running", "Figure 6. 
 A(opt_image("wokwi_serial.png", 5.4, "Wokwi serial monitor", "Figure 7. Serial Monitor output of the sketch.", "Wokwi Serial Monitor with occ/lamp/fan lines and ALERT lines"))
 A(opt_image("blynk_dashboard.png", 4.6, "Blynk dashboard", "Figure 8. Blynk Cloud dashboard for the classroom module (token hidden).", "Blynk web dashboard showing the live values"))
 
-A(h2("6.1 Wokwi test screenshots (W1-W8)"))
+A(h2("6.1 Wokwi test screenshots (W1-W4, W6-W8)"))
 A(p("One screenshot per Wokwi behaviour test. Each file goes in docs/screenshots/ and is picked up automatically when the report is rebuilt.", sz=20))
 for wid, nm, what in [
     ("W1", "Normal: occupied + dark, lamp ON", "Wokwi canvas and Serial Monitor showing occ=1, ldr=20 %, lamp=1"),
     ("W2", "31.5 C, fan ON + high_temperature event", "DHT22 set above 30 C, fan LED on, ALERT high_temperature in Serial"),
     ("W3", "Boundary 30.0 / 30.1 / 27.0 / 26.9 C", "Serial lines showing the fan flipping only above 30 C and below 27 C"),
     ("W4", "DHT SDA wire removed: sensor fault, fan OFF", "Disconnected DHT22 wire, sensor_failure alert, fan LED off"),
-    ("W5", "Recovery after reconnecting DHT", "Wire restored, alert cleared, logic resumed"),
     ("W6", "Vacancy 30 s: lamp OFF", "Serial: room vacant -> occ=0 lamp=0 fan=0"),
     ("W7", "Short PIR pulse ignored", "PIR delayTime 1, lamp stays OFF"),
     ("W8", "Wrong Blynk token: local control still works", "Blynk connection failure with lamp and fan still reacting"),
@@ -192,12 +199,12 @@ A(table([["Component", "ESP32 pin", "Direction", "Note"],
 A(h1("Project links"))
 A(table([["Item", "Link"],
          ["Wokwi project (classroom module)", "https://wokwi.com/projects/480812744829365249"],
-         ["GitHub repository", "[Insert GitHub repository URL]"],
-         ["Deployed dashboard", "[Insert deployed dashboard URL. The localhost address http://localhost:1880/campus only works on the lab PC]"]],
+         ["GitHub repository", "https://github.com/OCTehckie18/Integrated-IoT-Based-Campus-Management-System"],
+         ["Dashboard (local)", "http://localhost:1880/campus (served by Node-RED on the lab PC; no cloud deployment)"]],
         [3000, 6360]))
 
 A(h1("7. Limitations"))
-A(bullet("No physical hardware was used. Sensor accuracy, PIR behaviour, LDR calibration and electrical wiring are unvalidated. The Wokwi/Blynk firmware passed offline checks (C++ unit tests, diagram.json validation) and the simulator tests W1-W8; screenshots of the running simulator and the Blynk dashboard are in Section 6; W1-W4, W6, W7 and W8 have per-test screenshots; W5 (recovery after reconnecting the DHT) relies on the student-reported run because Wokwi applies wiring changes only on restart."))
+A(bullet("No physical hardware was used. Sensor accuracy, PIR behaviour, LDR calibration and electrical wiring are unvalidated. The Wokwi/Blynk firmware passed offline checks (C++ unit tests, diagram.json validation) and the simulator tests W1-W4 and W6-W8; screenshots of the running simulator and the Blynk dashboard are in Section 6; each of these tests has a per-test screenshot."))
 A(bullet("A PIR detects movement, not presence: a motionless person can lose the light after 30 s (recorded in test M6)."))
 A(bullet("The Wokwi lane does not feed the Node-RED platform (Wokwi cannot reach localhost), so the shared platform shows simulator data, not the Wokwi device. The optional MQTT firmware (firmware/classroom_esp32) would bridge this on real hardware, but PubSubClient publishes at QoS 0 only."))
 A(bullet("Blynk Cloud is a third-party service: the auth token is a secret kept out of the repository, and free-plan limits were not investigated. The ESP32 pin names in diagram.json are not documented by Wokwi and must be confirmed in the editor."))
@@ -207,7 +214,7 @@ A(bullet("The broker-outage test (T5b) was not executed automatically; evidence 
 A(bullet("SQLite and a single Node-RED instance suit a demo, not a campus-scale deployment."))
 
 A(h1("8. Future work"))
-A(p("Capture screenshots of the Wokwi runs; build and calibrate the circuit and run the firmware on a real ESP32, bridging it to the platform with QoS 1 publishing and an NTP source on the lab network; replace the role dropdown with real login and broker ACLs with TLS; "
+A(p("Re-run the remaining Wokwi scenarios (DHT reconnect recovery) with screenshots; build and calibrate the circuit and run the firmware on a real ESP32, bridging it to the platform with QoS 1 publishing and an NTP source on the lab network; replace the role dropdown with real login and broker ACLs with TLS; "
     "add a presence sensor to fix the stationary-occupant case; add trends and charts; and let the five other modules be implemented by their own devices using the same contract."))
 
 A(h1("Appendix A. Files and how to run"))
@@ -217,7 +224,7 @@ A(table([["Path", "Purpose"],
          ["simulator/classroom_logic.py, test_logic.py", "Tested control logic and its unit tests."],
          ["simulator/classroom_sim.py, campus_sim.py", "Simulated classroom device and the other five modules."],
          ["tests/run_tests.py, results.json", "Automated live validation and its raw results."],
-         ["wokwi/classroom/", "Wokwi project: sketch.ino, diagram.json, classroom_logic.h, libraries.txt, README with Blynk setup and tests W1-W8."],
+         ["wokwi/classroom/", "Wokwi project: sketch.ino, diagram.json, classroom_logic.h, libraries.txt, README with Blynk setup and tests W1-W4 and W6-W8."],
          ["platformio/classroom/", "PlatformIO fallback project (platformio.ini, wokwi.toml, generated src/main.cpp)."],
          ["tests/cpp/, tests/run_cpp_checks.py", "Native C++ unit tests, stubbed type-check and offline checks."],
          ["firmware/classroom_esp32/", "Optional MQTT firmware for real hardware (untested, future work)."],

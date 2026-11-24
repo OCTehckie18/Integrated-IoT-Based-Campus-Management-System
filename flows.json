@@ -1,0 +1,889 @@
+[
+    {
+        "id": "tab_main",
+        "type": "tab",
+        "label": "CHRIST Smart Campus",
+        "disabled": false,
+        "info": ""
+    },
+    {
+        "id": "broker",
+        "type": "mqtt-broker",
+        "name": "Local Mosquitto",
+        "broker": "127.0.0.1",
+        "port": "1883",
+        "clientid": "nodered-ingest",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": false
+    },
+    {
+        "id": "db",
+        "type": "sqlitedb",
+        "db": "data/campus.db",
+        "mode": "RWC"
+    },
+    {
+        "id": "mqin",
+        "type": "mqtt in",
+        "name": "telemetry/status/alerts",
+        "topic": "christ-smart-campus/v1/+/+/+/+",
+        "qos": "1",
+        "datatype": "utf8",
+        "broker": "broker",
+        "x": 150,
+        "y": 60,
+        "wires": [
+            [
+                "validate"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "validate",
+        "type": "function",
+        "name": "validate + route (FR-02)",
+        "func": "// FR-02 validation + routing for telemetry / status / alerts.\nconst REQ = [\"schema_version\",\"campus_id\",\"module\",\"building_id\",\"zone_id\",\n             \"device_id\",\"timestamp\",\"metric\",\"value\",\"unit\",\"status\"];\nconst MODULES = [\"classroom\",\"parking\",\"energy\",\"water\",\"waste\",\"safety\"];\nconst REG = {\"CLASS-A-ESP32-01\": [\"classroom\", \"BLOCK-A\", \"ROOM-204\"], \"PARK-C-SIM-01\": [\"parking\", \"BLOCK-C\", \"LOT-1\"], \"PARK-C-SIM-02\": [\"parking\", \"BLOCK-C\", \"LOT-1\"], \"PARK-C-SIM-03\": [\"parking\", \"BLOCK-C\", \"LOT-1\"], \"PARK-C-SIM-04\": [\"parking\", \"BLOCK-C\", \"LOT-1\"], \"ENERGY-A-SIM-01\": [\"energy\", \"BLOCK-A\", \"LAB-101\"], \"WATER-B-SIM-01\": [\"water\", \"BLOCK-B\", \"TANK-1\"], \"WASTE-B-SIM-01\": [\"waste\", \"BLOCK-B\", \"BIN-01\"], \"SAFE-B-SIM-01\": [\"safety\", \"BLOCK-B\", \"LAB-2\"]};                       // known devices: id -> [module, building, zone]\nconst KINDS = [\"telemetry\",\"status\",\"alerts\"];\nconst SEV = [\"info\",\"warning\",\"critical\"];\nconst RANGE = {temperature:[-10,60], light_level:[0,100], occupancy_count:[0,500],\n               co2_ppm:[250,5000], power_w:[0,5000], energy_kwh:[0,100000],\n               tank_level_pct:[0,100], bin_fill_pct:[0,100], water_flow_lpm:[0,200]};\nconst BOOLS = [\"occupancy_detected\",\"slot_occupied\",\"smoke_detected\",\"device_online\"];\n\nconst raw = (msg.payload === undefined || msg.payload === null) ? \"\" : msg.payload.toString();\nfunction reject(reason) {\n    return [{params: {$ts: new Date().toISOString(), $topic: msg.topic, $reason: reason,\n                      $raw: raw.substring(0, 500)}}, null, null, null, null, null];\n}\nconst t = (msg.topic || \"\").split(\"/\");   // [campus, v1, module, building, device, kind]\nif (t.length !== 6 || t[0] !== \"christ-smart-campus\" || t[1] !== \"v1\") return reject(\"bad_topic\");\nconst kind = t[5];\nif (!KINDS.includes(kind)) return reject(\"unknown_topic_kind:\" + kind);\nlet p;\ntry { p = JSON.parse(raw); } catch (e) { return reject(\"malformed_json\"); }\nif (typeof p !== \"object\" || p === null || Array.isArray(p)) return reject(\"malformed_json\");\nfor (const k of REQ) if (p[k] === undefined || p[k] === null || p[k] === \"\") return reject(\"missing_field:\" + k);\nif (!MODULES.includes(p.module)) return reject(\"unknown_module:\" + p.module);\nconst reg = REG[p.device_id];\nif (!reg) return reject(\"unknown_device:\" + p.device_id);\nif (reg[0] !== p.module || reg[1] !== p.building_id || reg[2] !== p.zone_id) return reject(\"registry_mismatch\");\nif (t[2] !== p.module || t[3] !== p.building_id || t[4] !== p.device_id) return reject(\"topic_payload_mismatch\");\nif (!/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$/.test(p.timestamp) ||\n    isNaN(Date.parse(p.timestamp))) return reject(\"invalid_timestamp\");\nif (Date.parse(p.timestamp) > Date.now() + 300000) return reject(\"timestamp_in_future\");\nif (BOOLS.includes(p.metric)) {\n    if (typeof p.value !== \"boolean\") return reject(\"wrong_type:\" + p.metric);\n} else if (RANGE[p.metric]) {\n    if (typeof p.value !== \"number\" || !isFinite(p.value)) return reject(\"wrong_type:\" + p.metric);\n    if (p.value < RANGE[p.metric][0] || p.value > RANGE[p.metric][1]) return reject(\"out_of_range:\" + p.metric);\n} else return reject(\"unknown_metric:\" + p.metric);\nif (typeof p.unit !== \"string\" || typeof p.status !== \"string\") return reject(\"wrong_type:unit_or_status\");\n\nconst isStatus = kind === \"status\";\nif (isStatus && (p.metric !== \"device_online\" || typeof p.value !== \"boolean\")) return reject(\"status_metric_invalid\");\nif (kind === \"alerts\") {\n    if (typeof p.alert_type !== \"string\" || !/^[a-z_]{1,40}$/.test(p.alert_type) ||\n        !SEV.includes(p.severity) || ![\"active\",\"cleared\"].includes(p.alert_state))\n        return reject(\"invalid_alert_fields\");\n}\n\nconst rx = new Date().toISOString();\nconst num = typeof p.value === \"boolean\" ? (p.value ? 1 : 0) : p.value;\nconst source = (typeof p.source === \"string\" ? p.source : \"unknown\").substring(0, 20);\n\n// Extra boolean/numeric fields on STATUS messages (light_on, fan_on...) are kept for the device page.\nlet extras = {};\nif (isStatus) {\n    let n = 0;\n    for (const k of Object.keys(p)) {\n        if (REQ.includes(k) || k === \"source\" || n >= 10 || !/^[a-z][a-z0-9_]{0,23}$/.test(k)) continue;\n        if (typeof p[k] === \"boolean\" || (typeof p[k] === \"number\" && isFinite(p[k]))) { extras[k] = p[k]; n++; }\n    }\n}\nconst dev = {params: {$id: p.device_id, $module: p.module, $building: p.building_id, $zone: p.zone_id,\n    $rx: rx, $online: isStatus ? (p.value ? 1 : 0) : 1, $is_status: isStatus ? 1 : 0,\n    $extras: JSON.stringify(extras), $source: source}};\nlet rd = null, lt = null, ai = null, ac = null;\nif (kind === \"telemetry\") {\n    rd = {params: {$ts: p.timestamp, $rx: rx, $module: p.module, $building: p.building_id, $zone: p.zone_id,\n        $device: p.device_id, $metric: p.metric, $value: num, $unit: p.unit, $status: p.status, $source: source}};\n    lt = {params: {$device: p.device_id, $metric: p.metric, $value: num, $unit: p.unit, $status: p.status,\n        $ts: p.timestamp, $rx: rx, $source: source}};\n}\nif (kind === \"alerts\") {\n    if (p.alert_state === \"active\") {\n        ai = {params: {$ts: p.timestamp, $rx: rx, $device: p.device_id, $module: p.module, $building: p.building_id,\n            $zone: p.zone_id, $type: p.alert_type, $severity: p.severity, $value: num, $unit: p.unit, $source: source}};\n    } else {\n        ac = {params: {$rx: rx, $device: p.device_id, $type: p.alert_type}};\n    }\n}\nreturn [null, dev, rd, lt, ai, ac];",
+        "outputs": 6,
+        "x": 400,
+        "y": 60,
+        "wires": [
+            [
+                "ins_rej",
+                "dbg"
+            ],
+            [
+                "ins_dev"
+            ],
+            [
+                "ins_read"
+            ],
+            [
+                "ins_latest"
+            ],
+            [
+                "ins_alert"
+            ],
+            [
+                "clr_alert"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ins_rej",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "INSERT INTO rejects (ts,topic,reason,raw) VALUES ($ts,$topic,$reason,$raw);",
+        "name": "store reject",
+        "x": 700,
+        "y": 20,
+        "wires": [
+            []
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "dbg",
+        "type": "debug",
+        "name": "rejects",
+        "active": true,
+        "tosidebar": true,
+        "complete": "params",
+        "x": 700,
+        "y": 60,
+        "wires": [],
+        "z": "tab_main"
+    },
+    {
+        "id": "ins_dev",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "INSERT INTO devices (device_id,module,building,zone,last_seen,reported_online,extras,source) VALUES ($id,$module,$building,$zone,$rx,$online,$extras,$source) ON CONFLICT(device_id) DO UPDATE SET last_seen=$rx, reported_online=$online, extras=CASE WHEN $is_status=1 THEN $extras ELSE extras END, source=$source;",
+        "name": "upsert device (last_seen/health)",
+        "x": 720,
+        "y": 100,
+        "wires": [
+            []
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ins_read",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "INSERT INTO readings (ts,rx,module,building,zone,device,metric,value,unit,status,source) VALUES ($ts,$rx,$module,$building,$zone,$device,$metric,$value,$unit,$status,$source);",
+        "name": "store reading",
+        "x": 700,
+        "y": 140,
+        "wires": [
+            []
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ins_latest",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "INSERT OR REPLACE INTO latest (device,metric,value,unit,status,ts,rx,source) VALUES ($device,$metric,$value,$unit,$status,$ts,$rx,$source);",
+        "name": "upsert latest",
+        "x": 700,
+        "y": 180,
+        "wires": [
+            []
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ins_alert",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "INSERT INTO alerts (ts,rx,device,module,building,zone,alert_type,severity,value,unit,source) SELECT $ts,$rx,$device,$module,$building,$zone,$type,$severity,$value,$unit,$source WHERE NOT EXISTS (SELECT 1 FROM alerts WHERE device=$device AND alert_type=$type AND cleared_ts IS NULL);",
+        "name": "open alert (dedup)",
+        "x": 700,
+        "y": 220,
+        "wires": [
+            []
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "clr_alert",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "UPDATE alerts SET cleared_ts=$rx WHERE device=$device AND alert_type=$type AND cleared_ts IS NULL;",
+        "name": "clear alert",
+        "x": 700,
+        "y": 260,
+        "wires": [
+            []
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "init",
+        "type": "inject",
+        "name": "start: create tables",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "once": true,
+        "onceDelay": "1",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 140,
+        "y": 340,
+        "wires": [
+            [
+                "ct_readings"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ct_readings",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "fixed",
+        "sql": "CREATE TABLE IF NOT EXISTS readings (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, rx TEXT, module TEXT, building TEXT, zone TEXT, device TEXT, metric TEXT, value REAL, unit TEXT, status TEXT, source TEXT);",
+        "name": "create readings",
+        "x": 340,
+        "y": 340,
+        "wires": [
+            [
+                "ct_rejects"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ct_rejects",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "fixed",
+        "sql": "CREATE TABLE IF NOT EXISTS rejects (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, topic TEXT, reason TEXT, raw TEXT);",
+        "name": "create rejects",
+        "x": 510,
+        "y": 340,
+        "wires": [
+            [
+                "ct_devices"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ct_devices",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "fixed",
+        "sql": "CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, module TEXT, building TEXT, zone TEXT, last_seen TEXT, reported_online INTEGER DEFAULT 0, extras TEXT DEFAULT '{}', source TEXT);",
+        "name": "create devices",
+        "x": 680,
+        "y": 340,
+        "wires": [
+            [
+                "ct_latest"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ct_latest",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "fixed",
+        "sql": "CREATE TABLE IF NOT EXISTS latest (device TEXT, metric TEXT, value REAL, unit TEXT, status TEXT, ts TEXT, rx TEXT, source TEXT, PRIMARY KEY (device, metric));",
+        "name": "create latest",
+        "x": 340,
+        "y": 380,
+        "wires": [
+            [
+                "ct_alerts"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ct_alerts",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "fixed",
+        "sql": "CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, rx TEXT, device TEXT, module TEXT, building TEXT, zone TEXT, alert_type TEXT, severity TEXT, value REAL, unit TEXT, cleared_ts TEXT, ack_by TEXT, ack_ts TEXT, source TEXT);",
+        "name": "create alerts",
+        "x": 510,
+        "y": 380,
+        "wires": [
+            [
+                "ct_index"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "ct_index",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "fixed",
+        "sql": "CREATE INDEX IF NOT EXISTS idx_readings_dev ON readings (device, id);",
+        "name": "create index",
+        "x": 680,
+        "y": 380,
+        "wires": [
+            [
+                "seed_fn"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "seed_fn",
+        "type": "function",
+        "name": "registry -> seed rows",
+        "func": "const REG = {\"CLASS-A-ESP32-01\": [\"classroom\", \"BLOCK-A\", \"ROOM-204\"], \"PARK-C-SIM-01\": [\"parking\", \"BLOCK-C\", \"LOT-1\"], \"PARK-C-SIM-02\": [\"parking\", \"BLOCK-C\", \"LOT-1\"], \"PARK-C-SIM-03\": [\"parking\", \"BLOCK-C\", \"LOT-1\"], \"PARK-C-SIM-04\": [\"parking\", \"BLOCK-C\", \"LOT-1\"], \"ENERGY-A-SIM-01\": [\"energy\", \"BLOCK-A\", \"LAB-101\"], \"WATER-B-SIM-01\": [\"water\", \"BLOCK-B\", \"TANK-1\"], \"WASTE-B-SIM-01\": [\"waste\", \"BLOCK-B\", \"BIN-01\"], \"SAFE-B-SIM-01\": [\"safety\", \"BLOCK-B\", \"LAB-2\"]};\nreturn [Object.keys(REG).map(id => ({params: {$id: id, $module: REG[id][0], $building: REG[id][1], $zone: REG[id][2]}}))];",
+        "outputs": 1,
+        "x": 340,
+        "y": 440,
+        "wires": [
+            [
+                "seed_sql"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "seed_sql",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "INSERT OR IGNORE INTO devices (device_id,module,building,zone,last_seen,reported_online,extras,source) VALUES ($id,$module,$building,$zone,NULL,0,'{}','registry');",
+        "name": "seed devices",
+        "x": 560,
+        "y": 440,
+        "wires": [
+            []
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "timer",
+        "type": "inject",
+        "name": "every 10 s",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "10",
+        "once": true,
+        "onceDelay": "5",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 130,
+        "y": 500,
+        "wires": [
+            [
+                "fn_timer"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_timer",
+        "type": "function",
+        "name": "cutoff = now - offline_s",
+        "func": "const offline_s = flow.get(\"offline_s\") || 120;\nconst now = new Date();\nmsg.params = {$now: now.toISOString(), $cutoff: new Date(now.getTime() - offline_s * 1000).toISOString()};\nreturn msg;",
+        "outputs": 1,
+        "x": 340,
+        "y": 500,
+        "wires": [
+            [
+                "off_ins"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "off_ins",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "INSERT INTO alerts (ts,rx,device,module,building,zone,alert_type,severity,value,unit,source) SELECT $now,$now,d.device_id,d.module,d.building,d.zone,'device_offline','warning',0,'bool','backend' FROM devices d WHERE d.last_seen IS NOT NULL AND (d.reported_online=0 OR d.last_seen < $cutoff) AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.device=d.device_id AND a.alert_type='device_offline' AND a.cleared_ts IS NULL);",
+        "name": "raise device_offline",
+        "x": 570,
+        "y": 500,
+        "wires": [
+            [
+                "off_clr"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "off_clr",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "UPDATE alerts SET cleared_ts=$now WHERE alert_type='device_offline' AND cleared_ts IS NULL AND device IN (SELECT device_id FROM devices WHERE reported_online=1 AND last_seen >= $cutoff);",
+        "name": "clear when back",
+        "x": 790,
+        "y": 500,
+        "wires": [
+            []
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "h_ov",
+        "type": "http in",
+        "name": "GET /api/overview",
+        "url": "/api/overview",
+        "method": "get",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 150,
+        "y": 580,
+        "wires": [
+            [
+                "fn_ov_q"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_ov_q",
+        "type": "function",
+        "name": "filters",
+        "func": "function getRole(msg) {\n    const r = String((msg.req.headers || {})[\"x-role\"] || \"viewer\").toLowerCase();\n    return [\"viewer\",\"operator\",\"administrator\"].includes(r) ? r : \"viewer\";\n}\nfunction deny(msg, need) { msg.statusCode = 403; msg.payload = {error: \"role_forbidden\", need: need}; return msg; }\nfunction bad(msg, why) { msg.statusCode = 400; msg.payload = {error: why}; return msg; }\nfunction filt(q) {\n    const ok = v => (typeof v === \"string\" && /^[A-Za-z0-9_-]{1,40}$/.test(v)) ? v : null;\n    return {$module: ok(q.module), $building: ok(q.building), $zone: ok(q.zone)};\n}\nmsg.params = filt(msg.req.query || {});\nreturn msg;",
+        "outputs": 1,
+        "x": 360,
+        "y": 580,
+        "wires": [
+            [
+                "sql_ov"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "sql_ov",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "SELECT d.device_id,d.module,d.building,d.zone,d.last_seen,d.reported_online,d.extras,d.source AS dev_source,l.metric,l.value,l.unit,l.status,l.ts,l.rx,l.source FROM devices d LEFT JOIN latest l ON l.device=d.device_id WHERE ($module IS NULL OR d.module=$module) AND ($building IS NULL OR d.building=$building) AND ($zone IS NULL OR d.zone=$zone) ORDER BY d.module,d.building,d.zone,d.device_id,l.metric;",
+        "name": "devices+latest",
+        "x": 540,
+        "y": 580,
+        "wires": [
+            [
+                "fn_ov_res"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_ov_res",
+        "type": "function",
+        "name": "health + shape",
+        "func": "const offline_s = flow.get(\"offline_s\") || 120;\nconst now = Date.now();\nconst map = {};\nfor (const r of msg.payload) {\n    let d = map[r.device_id];\n    if (!d) {\n        let extras = {}; try { extras = JSON.parse(r.extras || \"{}\"); } catch (e) {}\n        const seen = r.last_seen ? Date.parse(r.last_seen) : null;\n        const age = seen === null ? null : Math.max(0, Math.round((now - seen) / 1000));\n        let health = \"no_data\";                       // never heard from\n        if (seen !== null) health = !r.reported_online ? \"offline\" : (age > offline_s ? \"stale\" : \"online\");\n        d = map[r.device_id] = {device_id: r.device_id, module: r.module, building: r.building, zone: r.zone,\n            source: r.dev_source, last_seen: r.last_seen, age_s: age, health: health, extras: extras, metrics: []};\n    }\n    if (r.metric) d.metrics.push({metric: r.metric, value: r.value, unit: r.unit, status: r.status,\n                                  ts: r.ts, rx: r.rx, source: r.source});\n}\nmsg.payload = {now: new Date(now).toISOString(), offline_s: offline_s, devices: Object.values(map)};\nreturn msg;",
+        "outputs": 1,
+        "x": 740,
+        "y": 580,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "h_al",
+        "type": "http in",
+        "name": "GET /api/alerts",
+        "url": "/api/alerts",
+        "method": "get",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 150,
+        "y": 640,
+        "wires": [
+            [
+                "fn_al_q"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_al_q",
+        "type": "function",
+        "name": "filters",
+        "func": "function getRole(msg) {\n    const r = String((msg.req.headers || {})[\"x-role\"] || \"viewer\").toLowerCase();\n    return [\"viewer\",\"operator\",\"administrator\"].includes(r) ? r : \"viewer\";\n}\nfunction deny(msg, need) { msg.statusCode = 403; msg.payload = {error: \"role_forbidden\", need: need}; return msg; }\nfunction bad(msg, why) { msg.statusCode = 400; msg.payload = {error: why}; return msg; }\nfunction filt(q) {\n    const ok = v => (typeof v === \"string\" && /^[A-Za-z0-9_-]{1,40}$/.test(v)) ? v : null;\n    return {$module: ok(q.module), $building: ok(q.building), $zone: ok(q.zone)};\n}\n\nconst q = msg.req.query || {};\nmsg.params = Object.assign(filt(q), {$open: q.state === \"all\" ? 0 : 1});\nreturn msg;",
+        "outputs": 1,
+        "x": 360,
+        "y": 640,
+        "wires": [
+            [
+                "sql_al"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "sql_al",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "SELECT id,ts,rx,device,module,building,zone,alert_type,severity,value,unit,cleared_ts,ack_by,ack_ts,source FROM alerts WHERE ($module IS NULL OR module=$module) AND ($building IS NULL OR building=$building) AND ($zone IS NULL OR zone=$zone) AND ($open=0 OR cleared_ts IS NULL) ORDER BY id DESC LIMIT 200;",
+        "name": "alerts",
+        "x": 540,
+        "y": 640,
+        "wires": [
+            [
+                "fn_al_res"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_al_res",
+        "type": "function",
+        "name": "derive state",
+        "func": "msg.payload = msg.payload.map(a => Object.assign(a, {\n    state: a.cleared_ts ? \"cleared\" : (a.ack_ts ? \"acknowledged\" : \"active\")}));\nreturn msg;",
+        "outputs": 1,
+        "x": 740,
+        "y": 640,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "h_ack",
+        "type": "http in",
+        "name": "POST /api/alerts/:id/ack",
+        "url": "/api/alerts/:id/ack",
+        "method": "post",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 170,
+        "y": 700,
+        "wires": [
+            [
+                "fn_ack"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_ack",
+        "type": "function",
+        "name": "role >= operator",
+        "func": "function getRole(msg) {\n    const r = String((msg.req.headers || {})[\"x-role\"] || \"viewer\").toLowerCase();\n    return [\"viewer\",\"operator\",\"administrator\"].includes(r) ? r : \"viewer\";\n}\nfunction deny(msg, need) { msg.statusCode = 403; msg.payload = {error: \"role_forbidden\", need: need}; return msg; }\nfunction bad(msg, why) { msg.statusCode = 400; msg.payload = {error: why}; return msg; }\nfunction filt(q) {\n    const ok = v => (typeof v === \"string\" && /^[A-Za-z0-9_-]{1,40}$/.test(v)) ? v : null;\n    return {$module: ok(q.module), $building: ok(q.building), $zone: ok(q.zone)};\n}\n\nif (getRole(msg) === \"viewer\") return [null, deny(msg, \"operator\")];\nconst id = parseInt(msg.req.params.id, 10);\nif (!Number.isInteger(id) || id < 1) return [null, bad(msg, \"bad_id\")];\nmsg.params = {$by: getRole(msg), $ts: new Date().toISOString(), $id: id};\nreturn [msg, null];",
+        "outputs": 2,
+        "x": 400,
+        "y": 700,
+        "wires": [
+            [
+                "sql_ack"
+            ],
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "sql_ack",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "UPDATE alerts SET ack_by=$by, ack_ts=$ts WHERE id=$id AND ack_ts IS NULL AND cleared_ts IS NULL;",
+        "name": "acknowledge",
+        "x": 580,
+        "y": 700,
+        "wires": [
+            [
+                "fn_ack_res"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_ack_res",
+        "type": "function",
+        "name": "ok",
+        "func": "msg.payload = {ok: true};\nreturn msg;",
+        "outputs": 1,
+        "x": 760,
+        "y": 700,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "h_dr",
+        "type": "http in",
+        "name": "GET /api/device/:id/readings",
+        "url": "/api/device/:id/readings",
+        "method": "get",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 180,
+        "y": 760,
+        "wires": [
+            [
+                "fn_dr_q"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_dr_q",
+        "type": "function",
+        "name": "validate id",
+        "func": "function getRole(msg) {\n    const r = String((msg.req.headers || {})[\"x-role\"] || \"viewer\").toLowerCase();\n    return [\"viewer\",\"operator\",\"administrator\"].includes(r) ? r : \"viewer\";\n}\nfunction deny(msg, need) { msg.statusCode = 403; msg.payload = {error: \"role_forbidden\", need: need}; return msg; }\nfunction bad(msg, why) { msg.statusCode = 400; msg.payload = {error: why}; return msg; }\nfunction filt(q) {\n    const ok = v => (typeof v === \"string\" && /^[A-Za-z0-9_-]{1,40}$/.test(v)) ? v : null;\n    return {$module: ok(q.module), $building: ok(q.building), $zone: ok(q.zone)};\n}\n\nconst id = msg.req.params.id;\nif (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) return [null, bad(msg, \"bad_device\")];   // output 2 = straight to the response\nmsg.params = {$device: id};\nreturn [msg, null];",
+        "outputs": 2,
+        "x": 400,
+        "y": 760,
+        "wires": [
+            [
+                "sql_dr"
+            ],
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "sql_dr",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "SELECT ts,rx,metric,value,unit,status,source FROM readings WHERE device=$device ORDER BY id DESC LIMIT 40;",
+        "name": "last 40 readings",
+        "x": 580,
+        "y": 760,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "h_csv",
+        "type": "http in",
+        "name": "GET /api/export.csv",
+        "url": "/api/export.csv",
+        "method": "get",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 160,
+        "y": 820,
+        "wires": [
+            [
+                "fn_csv_q"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_csv_q",
+        "type": "function",
+        "name": "role = administrator",
+        "func": "function getRole(msg) {\n    const r = String((msg.req.headers || {})[\"x-role\"] || \"viewer\").toLowerCase();\n    return [\"viewer\",\"operator\",\"administrator\"].includes(r) ? r : \"viewer\";\n}\nfunction deny(msg, need) { msg.statusCode = 403; msg.payload = {error: \"role_forbidden\", need: need}; return msg; }\nfunction bad(msg, why) { msg.statusCode = 400; msg.payload = {error: why}; return msg; }\nfunction filt(q) {\n    const ok = v => (typeof v === \"string\" && /^[A-Za-z0-9_-]{1,40}$/.test(v)) ? v : null;\n    return {$module: ok(q.module), $building: ok(q.building), $zone: ok(q.zone)};\n}\n\nif (getRole(msg) !== \"administrator\") return [null, deny(msg, \"administrator\")];\nconst q = msg.req.query || {};\nconst dv = (typeof q.device === \"string\" && /^[A-Za-z0-9_-]{1,40}$/.test(q.device)) ? q.device : null;\nmsg.params = Object.assign(filt(q), {$device: dv});\nreturn [msg, null];",
+        "outputs": 2,
+        "x": 400,
+        "y": 820,
+        "wires": [
+            [
+                "sql_csv"
+            ],
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "sql_csv",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "SELECT ts,rx,module,building,zone,device,metric,value,unit,status,source FROM readings WHERE ($module IS NULL OR module=$module) AND ($building IS NULL OR building=$building) AND ($zone IS NULL OR zone=$zone) AND ($device IS NULL OR device=$device) ORDER BY id DESC LIMIT 50000;",
+        "name": "readings",
+        "x": 600,
+        "y": 820,
+        "wires": [
+            [
+                "fn_csv_res"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_csv_res",
+        "type": "function",
+        "name": "to CSV",
+        "func": "const cols = [\"ts\",\"rx\",\"module\",\"building\",\"zone\",\"device\",\"metric\",\"value\",\"unit\",\"status\",\"source\"];\n// Quote fields, and neutralise spreadsheet formulas (text starting with = + - @).\nfunction cell(v) {\n    if (v === null || v === undefined) return \"\";\n    let s = String(v);\n    if (typeof v === \"string\" && /^[=+\\-@]/.test(s)) s = \"'\" + s;\n    return /[\",\\n\\r]/.test(s) ? '\"' + s.replace(/\"/g, '\"\"') + '\"' : s;\n}\nconst lines = [cols.join(\",\")];\nfor (const r of msg.payload) lines.push(cols.map(c => cell(r[c])).join(\",\"));\nmsg.payload = lines.join(\"\\r\\n\") + \"\\r\\n\";\nmsg.headers = {\"Content-Type\": \"text/csv; charset=utf-8\",\n               \"Content-Disposition\": 'attachment; filename=\"campus_readings.csv\"'};\nreturn msg;",
+        "outputs": 1,
+        "x": 780,
+        "y": 820,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "h_rj",
+        "type": "http in",
+        "name": "GET /api/rejects",
+        "url": "/api/rejects",
+        "method": "get",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 150,
+        "y": 880,
+        "wires": [
+            [
+                "sql_rj"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "sql_rj",
+        "type": "sqlite",
+        "mydb": "db",
+        "sqlquery": "fixed",
+        "sql": "SELECT id,ts,topic,reason,raw FROM rejects ORDER BY id DESC LIMIT 50;",
+        "name": "last 50 rejects",
+        "x": 360,
+        "y": 880,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "h_cg",
+        "type": "http in",
+        "name": "GET /api/config",
+        "url": "/api/config",
+        "method": "get",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 150,
+        "y": 940,
+        "wires": [
+            [
+                "fn_cg"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_cg",
+        "type": "function",
+        "name": "read config",
+        "func": "msg.payload = {offline_s: flow.get('offline_s') || 120};\nreturn msg;",
+        "outputs": 1,
+        "x": 360,
+        "y": 940,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "h_cp",
+        "type": "http in",
+        "name": "POST /api/config",
+        "url": "/api/config",
+        "method": "post",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 150,
+        "y": 980,
+        "wires": [
+            [
+                "fn_cp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_cp",
+        "type": "function",
+        "name": "admin: set offline_s",
+        "func": "function getRole(msg) {\n    const r = String((msg.req.headers || {})[\"x-role\"] || \"viewer\").toLowerCase();\n    return [\"viewer\",\"operator\",\"administrator\"].includes(r) ? r : \"viewer\";\n}\nfunction deny(msg, need) { msg.statusCode = 403; msg.payload = {error: \"role_forbidden\", need: need}; return msg; }\nfunction bad(msg, why) { msg.statusCode = 400; msg.payload = {error: why}; return msg; }\nfunction filt(q) {\n    const ok = v => (typeof v === \"string\" && /^[A-Za-z0-9_-]{1,40}$/.test(v)) ? v : null;\n    return {$module: ok(q.module), $building: ok(q.building), $zone: ok(q.zone)};\n}\n\nif (getRole(msg) !== \"administrator\") return deny(msg, \"administrator\");\nconst v = Number((msg.payload || {}).offline_s);\nif (!Number.isInteger(v) || v < 10 || v > 3600) return bad(msg, \"offline_s must be an integer 10..3600\");\nflow.set(\"offline_s\", v);\nmsg.payload = {offline_s: v};\nreturn msg;",
+        "outputs": 1,
+        "x": 360,
+        "y": 980,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "h_pg",
+        "type": "http in",
+        "name": "GET /campus",
+        "url": "/campus",
+        "method": "get",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 130,
+        "y": 1040,
+        "wires": [
+            [
+                "f_page"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "f_page",
+        "type": "file in",
+        "name": "platform/dashboard.html",
+        "filename": "platform/dashboard.html",
+        "filenameType": "str",
+        "format": "utf8",
+        "chunk": false,
+        "sendError": true,
+        "encoding": "none",
+        "allProps": false,
+        "x": 360,
+        "y": 1040,
+        "wires": [
+            [
+                "fn_page"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_page",
+        "type": "function",
+        "name": "headers",
+        "func": "msg.headers = {\"Content-Type\": \"text/html; charset=utf-8\", \"X-Content-Type-Options\": \"nosniff\",\n    \"Content-Security-Policy\": \"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'\"};\nreturn msg;",
+        "outputs": 1,
+        "x": 600,
+        "y": 1040,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "resp",
+        "type": "http response",
+        "name": "",
+        "statusCode": "",
+        "headers": {},
+        "x": 980,
+        "y": 700,
+        "wires": [],
+        "z": "tab_main"
+    },
+    {
+        "id": "catch",
+        "type": "catch",
+        "name": "",
+        "scope": null,
+        "uncaught": false,
+        "x": 130,
+        "y": 1100,
+        "wires": [
+            [
+                "fn_err"
+            ]
+        ],
+        "z": "tab_main"
+    },
+    {
+        "id": "fn_err",
+        "type": "function",
+        "name": "500 for API errors",
+        "func": "if (msg.req && msg.res) { msg.statusCode = 500; msg.payload = {error: \"internal_error\"}; return msg; }\nreturn null;   // errors from the MQTT ingest branch are only logged",
+        "outputs": 1,
+        "x": 340,
+        "y": 1100,
+        "wires": [
+            [
+                "resp"
+            ]
+        ],
+        "z": "tab_main"
+    }
+]

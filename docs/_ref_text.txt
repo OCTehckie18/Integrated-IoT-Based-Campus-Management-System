@@ -1,0 +1,1931 @@
+
+=====PAGE 1=====
+ 
+  
+  
+MCA523B-5– Internet Of Things
+Project - Integrated IoT-Based Campus Management 
+System
+ 
+Smart Classroom Automation 
+Submitted by:  
+Kunnal
+2547231
+5 MCA B 
+Team:
+1. Alok 
+2. Kunnal 
+3. Pranav
+ 
+
+=====PAGE 2=====
+Module 1:
+Code:
+/*
+  CHRIST Smart Campus - Module 1: Intelligent Classroom
+  Device: CLASS-A-ESP32-01  |  Wokwi ESP32 DevKit C v4  |  v2: dashboard 
+integration
+  Publishes to the MQTT broker that your Node-RED dashboard (flows.json) 
+subscribes to.
+*/
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
+
+=====PAGE 3=====
+#include "DHT.h"
+// ---------- Pins ----------
+const int PIN_PIR       = 27;
+const int PIN_LDR       = 34;   // ADC1, safe with Wi-Fi
+const int PIN_DHT       = 15;
+const int PIN_LIGHT_LED = 25;   // red LED  = classroom light
+const int PIN_FAN_LED   = 26;   // green LED = fan indicator
+// ---------- Identity (Section 5 of the spec) ----------
+const char* SCHEMA_VERSION = "1.0";
+const char* CAMPUS_ID      = "CHRIST-DEMO";
+const char* MODULE_NAME    = "classroom";
+const char* BUILDING_ID    = "BLOCKA";
+const char* ZONE_ID        = "ROOM-204";
+const char* DEVICE_ID      = "CLASS-A-ESP32-01";
+const char* TOPIC_BASE     = "christ-smart-campus/v1/classroom/block-a/CLASS-A-
+ESP32-01";
+// ---------- Network ----------
+const char* WIFI_SSID  = "Wokwi-GUEST";
+const char* WIFI_PASS  = "";
+// Wokwi cannot reach localhost, so use a public broker (synthetic data only) or 
+a tunnelled/cloud broker.
+const char* MQTT_HOST  = "broker.hivemq.com";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER  = "";   // leave empty for anonymous brokers; never post 
+real credentials in screenshots
+const char* MQTT_PASS  = "";
+// Test switch for D9 (sensor disconnect): set true to simulate a dead DHT22
+const bool TEST_FORCE_DHT_FAULT = false;
+// ---------- Thresholds ----------
+const unsigned long OCC_TIMEOUT_MS = 30000;  // unoccupied for 30 s -> light OFF
+const float DARK_ON_LUX  = 100;              // below = dark
+const float DARK_OFF_LUX = 200;              // above = bright (hysteresis band 
+100-200)
+const float FAN_ON_C     = 30.0;             // fan ON above this
+const float FAN_OFF_C    = 27.0;             // fan OFF below this (hysteresis)
+// ---------- Timing ----------
+const unsigned long READ_MS      = 2000;   // DHT22 needs >= 2 s
+const unsigned long PUBLISH_MS   = 10000;  // periodic telemetry
+
+=====PAGE 4=====
+const unsigned long HEARTBEAT_MS = 30000;  // device_online
+const unsigned long RECONNECT_MS = 5000;
+DHT dht(PIN_DHT, DHT22);
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+char topicTelemetry[128], topicStatus[128], topicAlerts[128], clientId[40];
+bool occupied = false, lightOn = false, fanOn = false, sensorFault = false;
+float tempC = NAN, lux = 0;
+int dhtFails = 0;
+unsigned long lastMotion = 0, lastRead = 0, lastPublish = 0, lastBeat = 0, 
+lastTry = 0;
+// ---------- Helpers ----------
+bool nowIso(char* buf, size_t n) {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;          // time not synced yet
+  strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &t);      // UTC (configTime offset 0)
+  return true;
+}
+// value must already be a valid JSON literal: 29.2, true, false
+void publishMetric(const char* topic, const char* metric, const char* value,
+                   const char* unit, const char* status, bool retained = false) {
+  char ts[25];
+  if (!nowIso(ts, sizeof(ts)) || !mqtt.connected()) return;
+  char payload[400];
+  snprintf(payload, sizeof(payload),
+    
+"{\"schema_version\":\"%s\",\"campus_id\":\"%s\",\"module\":\"%s\",\"building_id\
+":\"%s\","
+    
+"\"zone_id\":\"%s\",\"device_id\":\"%s\",\"timestamp\":\"%s\",\"metric\":\"%s\","
+    "\"value\":%s,\"unit\":\"%s\",\"status\":\"%s\"}",
+    SCHEMA_VERSION, CAMPUS_ID, MODULE_NAME, BUILDING_ID, ZONE_ID, DEVICE_ID,
+    ts, metric, value, unit, status);
+  mqtt.publish(topic, payload, retained);
+  Serial.println(payload);
+}
+void pubBool(const char* metric, bool v) { publishMetric(topicTelemetry, metric, 
+v ? "true" : "false", "bool", "normal"); }
+
+=====PAGE 5=====
+void pubFloat(const char* metric, float v, const char* unit, const char* st = 
+"normal") {
+  char b[16]; snprintf(b, sizeof(b), "%.1f", v);
+  publishMetric(topicTelemetry, metric, b, unit, st);
+}
+void publishAll() {
+  pubBool("occupancy_detected", occupied);
+  pubFloat("light_level", lux, "lux");
+  if (!sensorFault) pubFloat("temperature", tempC, "C");
+  pubBool("light_state", lightOn);
+  pubBool("fan_state", fanOn);
+}
+float readLux() {
+  int raw = analogRead(PIN_LDR);
+  float v = raw / 4095.0 * 3.3;
+  if (raw <= 0) return 100000;            // very bright
+  if (v >= 3.29) return 0.1;              // very dark
+  float r = 2000 * v / (1 - v / 3.3);     // Wokwi LDR model (GAMMA 0.7, RL10 
+50k)
+  return pow(50e3 * pow(10, 0.7) / r, 1 / 0.7);
+}
+// ---------- Local logic ----------
+void updateOccupancy() {
+  if (digitalRead(PIN_PIR) == HIGH) {
+    lastMotion = millis();
+    if (!occupied) { occupied = true; pubBool("occupancy_detected", true); }
+  } else if (occupied && millis() - lastMotion >= OCC_TIMEOUT_MS) {
+    occupied = false; pubBool("occupancy_detected", false);
+  }
+}
+void readSensors() {
+  lux = readLux();
+  float t = TEST_FORCE_DHT_FAULT ? NAN : dht.readTemperature();
+  if (isnan(t)) {
+    if (++dhtFails >= 3 && !sensorFault) {
+      sensorFault = true;
+      publishMetric(topicAlerts, "sensor_fault", "true", "bool", "fault");
+      Serial.println("ALERT: DHT22 failure");
+    }
+  } else {
+
+=====PAGE 6=====
+    dhtFails = 0; tempC = t;
+    if (sensorFault) {
+      sensorFault = false;
+      publishMetric(topicAlerts, "sensor_fault", "false", "bool", "normal");
+    }
+  }
+}
+void applyLogic() {
+  bool newLight = lightOn;
+  if (!occupied) newLight = false;
+  else if (lux < DARK_ON_LUX) newLight = true;
+  else if (lux > DARK_OFF_LUX) newLight = false;
+  bool newFan = fanOn;
+  if (sensorFault || !occupied) newFan = false;      // safe state on sensor 
+error / empty room
+  else if (tempC > FAN_ON_C) newFan = true;
+  else if (tempC < FAN_OFF_C) newFan = false;
+  if (newLight != lightOn) { lightOn = newLight; digitalWrite(PIN_LIGHT_LED, 
+lightOn); pubBool("light_state", lightOn); }
+  if (newFan != fanOn)     { fanOn = newFan;     digitalWrite(PIN_FAN_LED, 
+fanOn);     pubBool("fan_state", fanOn); }
+}
+// ---------- Network (non-blocking: local logic keeps running offline) ---------
+-
+void keepConnected() {
+  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
+  if (millis() - lastTry < RECONNECT_MS) return;
+  lastTry = millis();
+  bool ok = (strlen(MQTT_USER) > 0) ? mqtt.connect(clientId, MQTT_USER, 
+MQTT_PASS) : mqtt.connect(clientId);
+  if (ok) {
+    Serial.println("MQTT connected");
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+  }
+}
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_PIR, INPUT);
+  pinMode(PIN_LIGHT_LED, OUTPUT);
+
+=====PAGE 7=====
+  pinMode(PIN_FAN_LED, OUTPUT);
+  dht.begin();
+  snprintf(topicTelemetry, sizeof(topicTelemetry), "%s/telemetry", TOPIC_BASE);
+  snprintf(topicStatus,    sizeof(topicStatus),    "%s/status",    TOPIC_BASE);
+  snprintf(topicAlerts,    sizeof(topicAlerts),    "%s/alerts",    TOPIC_BASE);
+  snprintf(clientId, sizeof(clientId), "%s-%04X", DEVICE_ID, 
+(uint16_t)esp_random());
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+  configTime(0, 0, "pool.ntp.org");        // UTC timestamps
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);                 // default 256 is too small for the 
+JSON
+  // No sensor read here: the first read happens in loop() after 2 s. Reading the 
+DHT22
+  // (which disables interrupts) while Wi-Fi is starting can crash the ESP32 at 
+boot.
+}
+void loop() {
+  keepConnected();
+  mqtt.loop();
+  updateOccupancy();
+  if (millis() - lastRead >= READ_MS) { lastRead = millis(); readSensors(); 
+applyLogic(); }
+  if (millis() - lastPublish >= PUBLISH_MS) { lastPublish = millis(); 
+publishAll(); }
+  if (millis() - lastBeat >= HEARTBEAT_MS) {
+    lastBeat = millis();
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+  }
+}
+
+=====PAGE 8=====
+
+=====PAGE 9=====
+
+=====PAGE 10=====
+All test for module 1
+
+=====PAGE 11=====
+
+=====PAGE 12=====
+
+=====PAGE 13=====
+
+=====PAGE 14=====
+
+=====PAGE 15=====
+Module 1 Block Diagram
+
+=====PAGE 16=====
+Module 2:
+Code:
+/*
+  CHRIST Smart Campus - Module 2: Smart Parking
+  Device: PARK-A-ESP32-01  |  Wokwi ESP32 DevKit C v4  |  3 slots
+*/
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
+// ---------- Pins (index 0..2 = SLOT-1..SLOT-3) ----------
+const int N_SLOTS = 3;
+const int PIN_TRIG[N_SLOTS] = {5, 19, 22};
+const int PIN_ECHO[N_SLOTS] = {18, 21, 23};
+const int PIN_LED[N_SLOTS]  = {27, 26, 25};
+
+=====PAGE 17=====
+// ---------- Identity (Section 5 of the spec) ----------
+const char* SCHEMA_VERSION = "1.0";
+const char* CAMPUS_ID      = "CHRIST-DEMO";
+const char* MODULE_NAME    = "parking";
+const char* BUILDING_ID    = "BLOCKA";
+const char* LOT_ZONE       = "LOT-A";                 // zone_id used for lot-
+level counts
+const char* DEVICE_ID      = "PARK-A-ESP32-01";
+const char* TOPIC_BASE     = "christ-smart-campus/v1/parking/block-a/PARK-A-
+ESP32-01";
+const char* SLOT_ZONE[N_SLOTS] = {"SLOT-1", "SLOT-2", "SLOT-3"};
+// ---------- Network ----------
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+// Must be the SAME broker as the 'Shared broker' node in flows.json (public 
+broker: synthetic data only).
+const char* MQTT_HOST = "broker.hivemq.com";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+// ---------- Calibration / thresholds ----------
+const float OCC_CM   = 20.0;   // distance below this = occupied
+const float FREE_CM  = 25.0;   // distance above this = free (20-25 cm = 
+hysteresis band, keeps old state)
+const float MIN_CM   = 2.0;    // valid HC-SR04 range
+const float MAX_CM   = 400.0;
+const int   DEBOUNCE_N    = 3; // consecutive readings needed to change state
+const int   INVALID_LIMIT = 3; // consecutive invalid readings = sensor fault
+// Test switch for D9 (sensor failure): set to 1, 2 or 3 to simulate that slot's 
+sensor dead. 0 = off.
+const int TEST_FORCE_FAULT_SLOT = 0;
+// Live distance updates: publish distance_cm when it moves by this much (at most 
+once per DIST_MIN_MS)
+const float DIST_DELTA_CM = 2.0;
+const unsigned long DIST_MIN_MS = 1000;
+// ---------- Timing ----------
+const unsigned long READ_MS      = 300;
+const unsigned long PUBLISH_MS   = 5000;
+
+=====PAGE 18=====
+const unsigned long HEARTBEAT_MS = 30000;
+const unsigned long RECONNECT_MS = 5000;
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+char topicTelemetry[128], topicStatus[128], topicAlerts[128], clientId[40];
+struct Slot {
+  bool init = false, occupied = false, fault = false;
+  int invalid = 0, agree = 0;
+  float cm = -1, pubCm = -1000;
+  unsigned long pubMs = 0;
+};
+Slot slots[N_SLOTS];
+unsigned long lastRead = 0, lastPublish = 0, lastBeat = 0, lastTry = 0;
+// ---------- Helpers ----------
+bool nowIso(char* buf, size_t n) {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+  strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &t);
+  return true;
+}
+// value must already be a valid JSON literal: 12.4, true, false, 2
+void publishMetric(const char* topic, const char* zone, const char* metric, const 
+char* value,
+                   const char* unit, const char* status, bool retained = false) {
+  char ts[25];
+  if (!nowIso(ts, sizeof(ts)) || !mqtt.connected()) return;
+  char payload[400];
+  snprintf(payload, sizeof(payload),
+    
+"{\"schema_version\":\"%s\",\"campus_id\":\"%s\",\"module\":\"%s\",\"building_id\
+":\"%s\","
+    
+"\"zone_id\":\"%s\",\"device_id\":\"%s\",\"timestamp\":\"%s\",\"metric\":\"%s\","
+    "\"value\":%s,\"unit\":\"%s\",\"status\":\"%s\"}",
+    SCHEMA_VERSION, CAMPUS_ID, MODULE_NAME, BUILDING_ID, zone, DEVICE_ID, ts, 
+metric, value, unit, status);
+  mqtt.publish(topic, payload, retained);
+  Serial.println(payload);
+}
+
+=====PAGE 19=====
+void pubSlot(int i) {
+  publishMetric(topicTelemetry, SLOT_ZONE[i], "slot_occupied", slots[i].occupied 
+? "true" : "false", "bool", "normal");
+}
+void pubDistance(int i) {
+  char b[16]; snprintf(b, sizeof(b), "%.1f", slots[i].cm);
+  publishMetric(topicTelemetry, SLOT_ZONE[i], "distance_cm", b, "cm", "normal");
+  slots[i].pubCm = slots[i].cm;
+  slots[i].pubMs = millis();
+}
+void pubFault(int i, bool fault) {
+  publishMetric(topicAlerts, SLOT_ZONE[i], "sensor_fault", fault ? "true" : 
+"false", "bool", fault ? "fault" : "normal");
+}
+// Faulty slots are not counted as free or occupied.
+void pubCounts() {
+  int occ = 0, avail = 0;
+  for (int i = 0; i < N_SLOTS; i++) {
+    if (slots[i].fault || !slots[i].init) continue;
+    if (slots[i].occupied) occ++; else avail++;
+  }
+  char b[8];
+  snprintf(b, sizeof(b), "%d", occ);        publishMetric(topicTelemetry, 
+LOT_ZONE, "occupancy_count", b, "slots", "normal");
+  snprintf(b, sizeof(b), "%d", avail);      publishMetric(topicTelemetry, 
+LOT_ZONE, "slots_available", b, "slots", "normal");
+  snprintf(b, sizeof(b), "%d", N_SLOTS);    publishMetric(topicTelemetry, 
+LOT_ZONE, "slots_total", b, "slots", "normal");
+}
+void publishAll() {
+  for (int i = 0; i < N_SLOTS; i++) {
+    if (slots[i].fault || !slots[i].init) continue;
+    pubSlot(i);
+    pubDistance(i);
+  }
+  pubCounts();
+}
+// ---------- Sensor ----------
+float readDistanceCm(int i) {
+  digitalWrite(PIN_TRIG[i], LOW);  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG[i], HIGH); delayMicroseconds(10);
+
+=====PAGE 20=====
+  digitalWrite(PIN_TRIG[i], LOW);
+  unsigned long us = pulseIn(PIN_ECHO[i], HIGH, 30000);   // 30 ms timeout (~5 m)
+  if (us == 0) return -1;                                 // no echo
+  float cm = us * 0.0343 / 2.0;
+  if (cm < MIN_CM || cm > MAX_CM) return -1;              // out of valid range
+  return cm;
+}
+void readSlot(int i) {
+  Slot& s = slots[i];
+  float cm = (TEST_FORCE_FAULT_SLOT == i + 1) ? -1 : readDistanceCm(i);
+  if (cm < 0) {                                           // invalid reading
+    if (++s.invalid >= INVALID_LIMIT && !s.fault) {
+      s.fault = true;
+      Serial.printf("ALERT: sensor fault on %s\n", SLOT_ZONE[i]);
+      pubFault(i, true);
+      pubCounts();
+    }
+    return;
+  }
+  s.invalid = 0;
+  s.cm = cm;
+  if (s.fault) {                                          // recovery
+    s.fault = false; s.init = false; s.agree = 0;
+    pubFault(i, false);
+  }
+  bool cand = s.occupied;                                 // hysteresis
+  if (cm < OCC_CM) cand = true;
+  else if (cm > FREE_CM) cand = false;
+  if (!s.init) {                                          // first valid reading: 
+take it immediately
+    s.init = true; s.occupied = cand; s.agree = 0;
+    pubSlot(i); pubDistance(i); pubCounts();
+    return;
+  }
+  if (cand != s.occupied) {                               // debounce
+    if (++s.agree >= DEBOUNCE_N) {
+      s.occupied = cand; s.agree = 0;
+      pubSlot(i); pubDistance(i); pubCounts();
+    }
+
+=====PAGE 21=====
+  } else {
+    s.agree = 0;
+  }
+  // live distance update while the slot state stays the same
+  if (fabs(s.cm - s.pubCm) >= DIST_DELTA_CM && millis() - s.pubMs >= DIST_MIN_MS) 
+pubDistance(i);
+}
+void updateLeds() {
+  bool blink = (millis() / 500) % 2;
+  for (int i = 0; i < N_SLOTS; i++) {
+    if (slots[i].fault) digitalWrite(PIN_LED[i], blink);  // fault: blink
+    else digitalWrite(PIN_LED[i], slots[i].init && slots[i].occupied);
+  }
+}
+// ---------- Network (non-blocking: local logic keeps running offline) ---------
+-
+void keepConnected() {
+  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
+  if (millis() - lastTry < RECONNECT_MS) return;
+  lastTry = millis();
+  bool ok = (strlen(MQTT_USER) > 0) ? mqtt.connect(clientId, MQTT_USER, 
+MQTT_PASS) : mqtt.connect(clientId);
+  if (ok) {
+    Serial.println("MQTT connected");
+    publishMetric(topicStatus, LOT_ZONE, "device_online", "true", "bool", 
+"normal", true);
+  }
+}
+void setup() {
+  Serial.begin(115200);
+  for (int i = 0; i < N_SLOTS; i++) {
+    pinMode(PIN_TRIG[i], OUTPUT);
+    pinMode(PIN_ECHO[i], INPUT);
+    pinMode(PIN_LED[i], OUTPUT);
+  }
+  snprintf(topicTelemetry, sizeof(topicTelemetry), "%s/telemetry", TOPIC_BASE);
+  snprintf(topicStatus,    sizeof(topicStatus),    "%s/status",    TOPIC_BASE);
+  snprintf(topicAlerts,    sizeof(topicAlerts),    "%s/alerts",    TOPIC_BASE);
+  snprintf(clientId, sizeof(clientId), "%s-%04X", DEVICE_ID, 
+(uint16_t)esp_random());
+
+=====PAGE 22=====
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+  configTime(0, 0, "pool.ntp.org");        // UTC timestamps
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);                 // default 256 is too small for the 
+JSON
+}
+void loop() {
+  keepConnected();
+  mqtt.loop();
+  if (millis() - lastRead >= READ_MS) {
+    lastRead = millis();
+    for (int i = 0; i < N_SLOTS; i++) readSlot(i);
+  }
+  updateLeds();
+  if (millis() - lastPublish >= PUBLISH_MS) { lastPublish = millis(); 
+publishAll(); }
+  if (millis() - lastBeat >= HEARTBEAT_MS) {
+    lastBeat = millis();
+    publishMetric(topicStatus, LOT_ZONE, "device_online", "true", "bool", 
+"normal", true);
+  }
+}
+
+=====PAGE 23=====
+
+=====PAGE 24=====
+
+=====PAGE 25=====
+All Sensor at 100 cm
+
+=====PAGE 26=====
+All Sensor at 10 cm
+
+=====PAGE 27=====
+
+=====PAGE 28=====
+
+=====PAGE 29=====
+Slot 2
+
+=====PAGE 30=====
+At 22 cm
+
+=====PAGE 31=====
+At 19 cm
+
+=====PAGE 32=====
+Occupied at 22 and 24 then free at 26
+
+=====PAGE 33=====
+
+=====PAGE 34=====
+
+=====PAGE 35=====
+
+=====PAGE 36=====
+
+=====PAGE 37=====
+Slot 3 Occupied
+
+=====PAGE 38=====
+
+=====PAGE 39=====
+Slot 2 Fault
+
+=====PAGE 40=====
+Slot 2 Recovery
+
+=====PAGE 41=====
+Module 2 Block Diagram
+
+=====PAGE 42=====
+Module 3:
+Code:
+/*
+  CHRIST Smart Campus - Module 3: Smart Energy   (SIMULATED measurement)
+  Device: ENERGY-A-ESP32-01  |  Wokwi ESP32 DevKit C v4
+*/
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
+// ---------- Pins ----------
+const int PIN_POT = 34;   // ADC1, safe with Wi-Fi
+const int PIN_BTN = 27;
+const int PIN_LED = 26;
+// ---------- Identity (Section 5 of the spec) ----------
+
+=====PAGE 43=====
+const char* SCHEMA_VERSION = "1.0";
+const char* CAMPUS_ID      = "CHRIST-DEMO";
+const char* MODULE_NAME    = "energy";
+const char* BUILDING_ID    = "BLOCKA";
+const char* ZONE_ID        = "METER-1";
+const char* DEVICE_ID      = "ENERGY-A-ESP32-01";
+const char* TOPIC_BASE     = "christ-smart-campus/v1/energy/block-a/ENERGY-A-
+ESP32-01";
+// ---------- Network ----------
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+// Must be the SAME broker the dashboard server uses (public broker: synthetic 
+data only).
+const char* MQTT_HOST = "broker.hivemq.com";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+// ---------- Simulated measurement ----------
+const float SUPPLY_V      = 12.0;   // nominal low-voltage DC supply (simulated)
+const float MAX_CURRENT_A = 5.0;    // potentiometer full scale = 5 A  ->  power 
+= 12 V x current = 0..60 W
+const float OVERLOAD_ON_W  = 50.0;  // alert above this
+const float OVERLOAD_OFF_W = 45.0;  // clears below this (hysteresis)
+const int   INVALID_LIMIT  = 3;     // consecutive invalid readings = sensor 
+fault
+const float ENERGY_TIME_SCALE = 1.0; // set to 60 for demos: 1 real second counts 
+as 1 minute of energy
+// Live power updates: publish when power moves by this much (at most once per 
+POWER_MIN_MS)
+const float POWER_DELTA_W = 1.0;
+const unsigned long POWER_MIN_MS = 1000;
+// ---------- Timing ----------
+const unsigned long READ_MS      = 200;
+const unsigned long PUBLISH_MS   = 5000;
+const unsigned long HEARTBEAT_MS = 30000;
+const unsigned long RECONNECT_MS = 5000;
+const unsigned long STATUS_MS    = 10000;   // diagnostic line in the Serial 
+Monitor
+WiFiClient wifiClient;
+
+=====PAGE 44=====
+PubSubClient mqtt(wifiClient);
+char topicTelemetry[128], topicStatus[128], topicAlerts[128], clientId[40];
+bool sensorDisconnected = false;   // toggled by the pushbutton (test input)
+bool sensorFault = false, overload = false;
+int invalidCount = 0;
+float powerW = 0, energyKwh = 0, pubW = -1000;
+bool haveReading = false;
+unsigned long pubMs = 0, lastRead = 0, lastTick = 0, lastPublish = 0, lastBeat = 
+0, lastTry = 0, lastStatus = 0;
+unsigned long lastBtnMs = 0;
+int lastBtn = HIGH;
+struct PendingAlert { bool pending = false, value = false; };
+PendingAlert pFault, pOver;
+// ---------- Helpers ----------
+bool nowIso(char* buf, size_t n) {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+  strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &t);
+  return true;
+}
+// value must already be a valid JSON literal: 30.0, true, false
+bool publishMetric(const char* topic, const char* metric, const char* value,
+                   const char* unit, const char* status, bool retained = false) {
+  char ts[25];
+  if (!nowIso(ts, sizeof(ts)) || !mqtt.connected()) return false;
+  char payload[400];
+  snprintf(payload, sizeof(payload),
+    
+"{\"schema_version\":\"%s\",\"campus_id\":\"%s\",\"module\":\"%s\",\"building_id\
+":\"%s\","
+    
+"\"zone_id\":\"%s\",\"device_id\":\"%s\",\"timestamp\":\"%s\",\"metric\":\"%s\","
+    "\"value\":%s,\"unit\":\"%s\",\"status\":\"%s\"}",
+    SCHEMA_VERSION, CAMPUS_ID, MODULE_NAME, BUILDING_ID, ZONE_ID, DEVICE_ID, ts, 
+metric, value, unit, status);
+  bool ok = mqtt.publish(topic, payload, retained);
+  Serial.println(payload);
+  return ok;
+}
+
+=====PAGE 45=====
+void publishPower() {
+  char b[16]; snprintf(b, sizeof(b), "%.1f", powerW);
+  if (publishMetric(topicTelemetry, "power_w", b, "W", overload ? "warning" : 
+"normal")) {
+    pubW = powerW; pubMs = millis();
+  }
+}
+void publishEnergy() {
+  char b[20]; snprintf(b, sizeof(b), "%.4f", energyKwh);
+  publishMetric(topicTelemetry, "energy_kwh", b, "kWh", "normal");
+}
+// Alerts are retried until delivered, so a dropped connection cannot leave an 
+alert stuck on the dashboard.
+bool pubAlert(const char* metric, bool v, const char* activeStatus) {
+  return publishMetric(topicAlerts, metric, v ? "true" : "false", "bool", v ? 
+activeStatus : "normal");
+}
+void flushAlerts() {
+  if (pFault.pending && pubAlert("sensor_fault", pFault.value, "fault"))   
+ pFault.pending = false;
+  if (pOver.pending  && pubAlert("overload",     pOver.value,  "critical")) 
+pOver.pending = false;
+}
+// ---------- Test input: button toggles "sensor disconnected" ----------
+void checkButton() {
+  int b = digitalRead(PIN_BTN);
+  if (b != lastBtn && millis() - lastBtnMs > 50) {
+    lastBtnMs = millis();
+    lastBtn = b;
+    if (b == LOW) {
+      sensorDisconnected = !sensorDisconnected;
+      Serial.println(sensorDisconnected ? "TEST: sensor DISCONNECTED" : "TEST: 
+sensor reconnected");
+    }
+  }
+}
+// ---------- Measurement ----------
+float readCurrentA() {                       // returns -1 when the sensor is 
+disconnected / invalid
+  if (sensorDisconnected) return -1;
+  long sum = 0;
+
+=====PAGE 46=====
+  for (int i = 0; i < 8; i++) sum += analogRead(PIN_POT);   // average to smooth 
+noise
+  return (sum / 8.0) / 4095.0 * MAX_CURRENT_A;
+}
+void measure() {
+  unsigned long now = millis();
+  float a = readCurrentA();
+  if (a < 0) {                                              // invalid reading
+    lastTick = now;
+    if (++invalidCount >= INVALID_LIMIT && !sensorFault) {
+      sensorFault = true;
+      Serial.println("ALERT: energy sensor fault");
+      pFault.pending = true; pFault.value = true; flushAlerts();
+    }
+    return;
+  }
+  invalidCount = 0;
+  if (sensorFault) {                                        // recovery
+    sensorFault = false;
+    pFault.pending = true; pFault.value = false; flushAlerts();
+  }
+  powerW = a * SUPPLY_V;
+  if (haveReading)                                          // kWh = W x hours
+    energyKwh += powerW * ((now - lastTick) * ENERGY_TIME_SCALE) / 3.6e9;
+  haveReading = true;
+  lastTick = now;
+  if (!overload && powerW > OVERLOAD_ON_W) {                // abnormal reading, 
+with hysteresis
+    overload = true;
+    Serial.println("ALERT: overload");
+    pOver.pending = true; pOver.value = true; flushAlerts();
+  } else if (overload && powerW < OVERLOAD_OFF_W) {
+    overload = false;
+    pOver.pending = true; pOver.value = false; flushAlerts();
+  }
+}
+void updateLed() {
+
+=====PAGE 47=====
+  if (sensorFault) digitalWrite(PIN_LED, (millis() / 250) % 2);   // blink = 
+sensor fault
+  else digitalWrite(PIN_LED, overload);                           // solid = 
+overload
+}
+// ---------- Network (non-blocking: local logic keeps running offline) ---------
+-
+void keepConnected() {
+  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
+  if (millis() - lastTry < RECONNECT_MS) return;
+  lastTry = millis();
+  bool ok = (strlen(MQTT_USER) > 0) ? mqtt.connect(clientId, MQTT_USER, 
+MQTT_PASS) : mqtt.connect(clientId);
+  if (ok) {
+    Serial.println("MQTT connected");
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+  } else {
+    Serial.printf("MQTT connect failed, state=%d\n", mqtt.state());
+  }
+}
+// Messages are silently skipped until Wi-Fi, MQTT and the clock are all ready; 
+this line shows which one is missing.
+void statusLine() {
+  struct tm t;
+  Serial.printf("[status] wifi=%s mqtt=%s time=%s\n",
+    WiFi.status() == WL_CONNECTED ? "OK" : "NO",
+    mqtt.connected() ? "OK" : "NO",
+    getLocalTime(&t, 0) ? "OK" : "NO");
+}
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_BTN, INPUT_PULLUP);
+  pinMode(PIN_LED, OUTPUT);
+  snprintf(topicTelemetry, sizeof(topicTelemetry), "%s/telemetry", TOPIC_BASE);
+  snprintf(topicStatus,    sizeof(topicStatus),    "%s/status",    TOPIC_BASE);
+  snprintf(topicAlerts,    sizeof(topicAlerts),    "%s/alerts",    TOPIC_BASE);
+  snprintf(clientId, sizeof(clientId), "%s-%04X", DEVICE_ID, 
+(uint16_t)esp_random());
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+  configTime(0, 0, "pool.ntp.org");        // UTC timestamps
+
+=====PAGE 48=====
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);                 // default 256 is too small for the 
+JSON
+  mqtt.setSocketTimeout(5);                // do not freeze the loop when the 
+broker is unreachable
+  lastTick = millis();
+}
+void loop() {
+  keepConnected();
+  mqtt.loop();
+  checkButton();
+  if (millis() - lastRead >= READ_MS) { lastRead = millis(); measure(); }
+  updateLed();
+  if (!sensorFault && haveReading && fabs(powerW - pubW) >= POWER_DELTA_W && 
+millis() - pubMs >= POWER_MIN_MS) publishPower();
+  if (millis() - lastStatus >= STATUS_MS) { lastStatus = millis(); statusLine(); 
+}
+  if (millis() - lastPublish >= PUBLISH_MS) {
+    lastPublish = millis();
+    flushAlerts();
+    if (!sensorFault && haveReading) { publishPower(); publishEnergy(); }
+  }
+  if (millis() - lastBeat >= HEARTBEAT_MS) {
+    lastBeat = millis();
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+  }
+}
+
+=====PAGE 49=====
+
+=====PAGE 50=====
+Zero Overload:
+
+=====PAGE 51=====
+Safe test load:
+
+=====PAGE 52=====
+Abnormal Reading
+
+=====PAGE 53=====
+
+=====PAGE 54=====
+Boundary
+
+=====PAGE 55=====
+
+=====PAGE 56=====
+Sensor Disconnected
+
+=====PAGE 57=====
+Sensor Reconnected
+
+=====PAGE 58=====
+
+=====PAGE 59=====
+Module 3 Block Diagram:
+
+=====PAGE 60=====
+Module 4:
+Code:
+/*
+  CHRIST Smart Campus - Module 4: Smart Water
+  Device: WATER-A-ESP32-01  |  Wokwi ESP32 DevKit C v4
+*/
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
+// ---------- Pins ----------
+const int PIN_TRIG = 5;
+const int PIN_ECHO = 18;
+const int PIN_FLOW = 14;
+const int PIN_LEAK = 27;
+const int PIN_PUMP_LED  = 25;   // green
+const int PIN_ALERT_LED = 26;   // red
+
+=====PAGE 61=====
+// ---------- Identity (Section 5 of the spec) ----------
+const char* SCHEMA_VERSION = "1.0";
+const char* CAMPUS_ID      = "CHRIST-DEMO";
+const char* MODULE_NAME    = "water";
+const char* BUILDING_ID    = "BLOCKA";
+const char* ZONE_ID        = "TANK-1";
+const char* DEVICE_ID      = "WATER-A-ESP32-01";
+const char* TOPIC_BASE     = "christ-smart-campus/v1/water/block-a/WATER-A-ESP32-
+01";
+// ---------- Network ----------
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+// Must be the SAME broker the dashboard server uses (public broker: synthetic 
+data only).
+const char* MQTT_HOST = "broker.hivemq.com";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+// ---------- Calibration (sensor mounted at the top of the tank) ----------
+const float FULL_CM  = 10.0;    // distance to the water surface when the tank is 
+full  = 100 %
+const float EMPTY_CM = 100.0;   // distance when the tank is empty               
+        = 0 %
+const float MIN_CM   = 2.0;     // HC-SR04 minimum
+const float MAX_VALID_CM = EMPTY_CM + 30.0;   // anything farther is not a tank 
+reading (e.g. Wokwi's default 400 cm) = invalid
+const float LOW_ON_PCT   = 20.0;   // low-level alert below this (configurable)
+const float LOW_OFF_PCT  = 25.0;   // clears above this (hysteresis)
+const float PUMP_ON_PCT  = 30.0;   // demo pump starts below this
+const float PUMP_OFF_PCT = 90.0;   // demo pump stops above this
+const int   INVALID_LIMIT = 3;     // consecutive invalid readings = sensor fault
+// Simulated flow sensor: each button press = one pulse = 1/PULSES_PER_LITRE 
+litres
+const float PULSES_PER_LITRE = 10.0;
+const unsigned long FLOW_WINDOW_MS = 5000;
+// Test switch for D9 (sensor failure): true = pretend the tank sensor is dead
+const bool TEST_FORCE_SENSOR_FAULT = false;
+
+=====PAGE 62=====
+// Live level updates: publish when the level moves by this much (at most once 
+per LEVEL_MIN_MS)
+const float LEVEL_DELTA_PCT = 2.0;
+const unsigned long LEVEL_MIN_MS = 1000;
+// ---------- Timing ----------
+const unsigned long READ_MS      = 300;
+const unsigned long PUBLISH_MS   = 5000;
+const unsigned long HEARTBEAT_MS = 30000;
+const unsigned long RECONNECT_MS = 5000;
+const unsigned long STATUS_MS    = 10000;
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+char topicTelemetry[128], topicStatus[128], topicAlerts[128], clientId[40];
+bool sensorFault = false, lowLevel = false, leak = false, pumpOn = false, 
+haveLevel = false;
+int invalidCount = 0, leakAgree = 0;
+float distanceCm = -1, levelPct = 0, pubPct = -1000, flowLpm = 0;
+unsigned long pubMs = 0, lastRead = 0, lastPublish = 0, lastBeat = 0, lastTry = 
+0, lastStatus = 0;
+unsigned long flowWinStart = 0, lastBtnMs = 0;
+int lastBtn = HIGH;
+volatile unsigned long pulses = 0;
+// Alerts are retried until delivered, so a dropped connection cannot leave an 
+alert stuck on the dashboard.
+enum { A_FAULT = 0, A_LOW = 1, A_LEAK = 2, N_ALERTS = 3 };
+struct AlertSlot { const char* metric; const char* activeStatus; bool pending; 
+bool value; };
+AlertSlot alerts[N_ALERTS] = {
+  {"sensor_fault", "fault",    false, false},
+  {"low_level",    "warning",  false, false},
+  {"leak",         "critical", false, false}
+};
+// ---------- Helpers ----------
+bool nowIso(char* buf, size_t n) {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+  strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &t);
+  return true;
+}
+
+=====PAGE 63=====
+// value must already be a valid JSON literal: 55.0, true, false
+bool publishMetric(const char* topic, const char* metric, const char* value,
+                   const char* unit, const char* status, bool retained = false) {
+  char ts[25];
+  if (!nowIso(ts, sizeof(ts)) || !mqtt.connected()) return false;
+  char payload[400];
+  snprintf(payload, sizeof(payload),
+    
+"{\"schema_version\":\"%s\",\"campus_id\":\"%s\",\"module\":\"%s\",\"building_id\
+":\"%s\","
+    
+"\"zone_id\":\"%s\",\"device_id\":\"%s\",\"timestamp\":\"%s\",\"metric\":\"%s\","
+    "\"value\":%s,\"unit\":\"%s\",\"status\":\"%s\"}",
+    SCHEMA_VERSION, CAMPUS_ID, MODULE_NAME, BUILDING_ID, ZONE_ID, DEVICE_ID, ts, 
+metric, value, unit, status);
+  bool ok = mqtt.publish(topic, payload, retained);
+  Serial.println(payload);
+  return ok;
+}
+void publishLevel() {
+  char b[16]; snprintf(b, sizeof(b), "%.1f", levelPct);
+  if (publishMetric(topicTelemetry, "tank_level_pct", b, "%", lowLevel ? 
+"warning" : "normal")) {
+    pubPct = levelPct; pubMs = millis();
+  }
+}
+void publishFlow() {
+  char b[16]; snprintf(b, sizeof(b), "%.1f", flowLpm);
+  publishMetric(topicTelemetry, "water_flow_lpm", b, "L/min", "normal");
+}
+void publishPump() {
+  publishMetric(topicTelemetry, "pump_state", pumpOn ? "true" : "false", "bool", 
+"normal");
+}
+void queueAlert(int k, bool v) { alerts[k].pending = true; alerts[k].value = v; }
+void flushAlerts() {
+  for (int k = 0; k < N_ALERTS; k++) {
+    if (!alerts[k].pending) continue;
+    bool v = alerts[k].value;
+    if (publishMetric(topicAlerts, alerts[k].metric, v ? "true" : "false", 
+"bool", v ? alerts[k].activeStatus : "normal"))
+
+=====PAGE 64=====
+      alerts[k].pending = false;
+  }
+}
+// ---------- Simulated flow sensor (button pulses) ----------
+void checkFlowButton() {
+  int b = digitalRead(PIN_FLOW);
+  if (b != lastBtn && millis() - lastBtnMs > 30) {
+    lastBtnMs = millis();
+    lastBtn = b;
+    if (b == LOW) pulses++;                  // one pulse per press
+  }
+}
+void checkFlowWindow() {
+  if (millis() - flowWinStart < FLOW_WINDOW_MS) return;
+  unsigned long p = pulses; pulses = 0;
+  flowLpm = p * (60000.0 / FLOW_WINDOW_MS) / PULSES_PER_LITRE;   // litres per 
+minute
+  flowWinStart = millis();
+  publishFlow();
+}
+// ---------- Tank sensor ----------
+float readDistanceCm() {
+  if (TEST_FORCE_SENSOR_FAULT) return -1;
+  digitalWrite(PIN_TRIG, LOW);  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  unsigned long us = pulseIn(PIN_ECHO, HIGH, 30000);
+  if (us == 0) return -1;                                    // no echo
+  float cm = us * 0.0343 / 2.0;
+  if (cm < MIN_CM || cm > MAX_VALID_CM) return -1;           // not a plausible 
+tank reading
+  return cm;
+}
+float toPercent(float cm) {
+  float p = (EMPTY_CM - cm) / (EMPTY_CM - FULL_CM) * 100.0;
+  if (p < 0) p = 0;
+  if (p > 100) p = 100;
+  return p;
+}
+
+=====PAGE 65=====
+void measure() {
+  // --- leak switch (LOW = leak), needs 2 consistent reads ---
+  bool leakNow = (digitalRead(PIN_LEAK) == LOW);
+  if (leakNow != leak) {
+    if (++leakAgree >= 2) {
+      leak = leakNow; leakAgree = 0;
+      Serial.println(leak ? "ALERT: LEAK DETECTED" : "Leak cleared");
+      queueAlert(A_LEAK, leak); flushAlerts();
+    }
+  } else leakAgree = 0;
+  // --- tank level ---
+  float cm = readDistanceCm();
+  if (cm < 0) {
+    if (++invalidCount >= INVALID_LIMIT && !sensorFault) {
+      sensorFault = true;
+      Serial.println("ALERT: tank sensor fault (no echo, or distance outside the 
+tank range 2-130 cm)");
+      queueAlert(A_FAULT, true); flushAlerts();
+    }
+  } else {
+    invalidCount = 0;
+    distanceCm = cm;
+    if (sensorFault) { sensorFault = false; queueAlert(A_FAULT, false); 
+flushAlerts(); }
+    levelPct = toPercent(cm);
+    haveLevel = true;
+    if (!lowLevel && levelPct < LOW_ON_PCT) {               // low-level alert 
+with hysteresis
+      lowLevel = true;
+      Serial.println("ALERT: low water level");
+      queueAlert(A_LOW, true); flushAlerts();
+    } else if (lowLevel && levelPct > LOW_OFF_PCT) {
+      lowLevel = false;
+      queueAlert(A_LOW, false); flushAlerts();
+    }
+  }
+  // --- demo pump (LED): fills below 30 %, stops above 90 %; always off on leak 
+or sensor fault ---
+  bool want = pumpOn;
+  if (leak || sensorFault) want = false;
+  else if (haveLevel && levelPct < PUMP_ON_PCT) want = true;
+
+=====PAGE 66=====
+  else if (haveLevel && levelPct > PUMP_OFF_PCT) want = false;
+  if (want != pumpOn) { pumpOn = want; publishPump(); }
+}
+void updateLeds() {
+  digitalWrite(PIN_PUMP_LED, pumpOn);
+  if (sensorFault) digitalWrite(PIN_ALERT_LED, (millis() / 250) % 2);   // blink 
+= sensor fault
+  else digitalWrite(PIN_ALERT_LED, lowLevel || leak);                   // solid 
+= low level or leak
+}
+// ---------- Network (non-blocking: local logic keeps running offline) ---------
+-
+void keepConnected() {
+  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
+  if (millis() - lastTry < RECONNECT_MS) return;
+  lastTry = millis();
+  bool ok = (strlen(MQTT_USER) > 0) ? mqtt.connect(clientId, MQTT_USER, 
+MQTT_PASS) : mqtt.connect(clientId);
+  if (ok) {
+    Serial.println("MQTT connected");
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+  } else {
+    Serial.printf("MQTT connect failed, state=%d\n", mqtt.state());
+  }
+}
+// Messages are silently skipped until Wi-Fi, MQTT and the clock are all ready; 
+this line shows which one is missing.
+void statusLine() {
+  struct tm t;
+  Serial.printf("[status] wifi=%s mqtt=%s time=%s | distance=%.1f cm 
+level=%.1f%%\n",
+    WiFi.status() == WL_CONNECTED ? "OK" : "NO",
+    mqtt.connected() ? "OK" : "NO",
+    getLocalTime(&t, 0) ? "OK" : "NO",
+    distanceCm, levelPct);
+}
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+
+=====PAGE 67=====
+  pinMode(PIN_FLOW, INPUT_PULLUP);
+  pinMode(PIN_LEAK, INPUT_PULLUP);
+  pinMode(PIN_PUMP_LED, OUTPUT);
+  pinMode(PIN_ALERT_LED, OUTPUT);
+  snprintf(topicTelemetry, sizeof(topicTelemetry), "%s/telemetry", TOPIC_BASE);
+  snprintf(topicStatus,    sizeof(topicStatus),    "%s/status",    TOPIC_BASE);
+  snprintf(topicAlerts,    sizeof(topicAlerts),    "%s/alerts",    TOPIC_BASE);
+  snprintf(clientId, sizeof(clientId), "%s-%04X", DEVICE_ID, 
+(uint16_t)esp_random());
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+  configTime(0, 0, "pool.ntp.org");        // UTC timestamps
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);                 // default 256 is too small for the 
+JSON
+  mqtt.setSocketTimeout(5);                // do not freeze the loop when the 
+broker is unreachable
+  flowWinStart = millis();
+}
+void loop() {
+  keepConnected();
+  mqtt.loop();
+  checkFlowButton();
+  checkFlowWindow();
+  if (millis() - lastRead >= READ_MS) { lastRead = millis(); measure(); }
+  updateLeds();
+  // live level update between the periodic ones
+  if (!sensorFault && haveLevel && fabs(levelPct - pubPct) >= LEVEL_DELTA_PCT && 
+millis() - pubMs >= LEVEL_MIN_MS) publishLevel();
+  if (millis() - lastStatus >= STATUS_MS) { lastStatus = millis(); statusLine(); 
+}
+  if (millis() - lastPublish >= PUBLISH_MS) {
+    lastPublish = millis();
+    flushAlerts();
+    if (!sensorFault && haveLevel) publishLevel();
+    publishPump();
+  }
+  if (millis() - lastBeat >= HEARTBEAT_MS) {
+    lastBeat = millis();
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+
+=====PAGE 68=====
+  }
+}
+Distance 10 cm:
+
+=====PAGE 69=====
+
+=====PAGE 70=====
+Distance 55cm:
+
+=====PAGE 71=====
+
+=====PAGE 72=====
+Distance 84cm:
+
+=====PAGE 73=====
+Distance 80cm
+
+=====PAGE 74=====
+Distance 77cm
+
+=====PAGE 75=====
+Distance 100cm
+
+=====PAGE 76=====
+
+=====PAGE 77=====
+6L Button Test
+
+=====PAGE 78=====
+
+=====PAGE 79=====
+Leak Alert
+
+=====PAGE 80=====
+
+=====PAGE 81=====
+Distance 400cm
+
+=====PAGE 82=====
+
+=====PAGE 83=====
+Distance 55cm
+
+=====PAGE 84=====
+
+=====PAGE 85=====
+Module 4 Block Diagram
+
+=====PAGE 86=====
+Module 5:
+Code:
+/*
+  CHRIST Smart Campus - Module 5: Smart Waste
+  Device: WASTE-A-ESP32-01  |  Wokwi ESP32 DevKit C v4
+*/
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
+// ---------- Pins ----------
+const int PIN_TRIG = 5;
+const int PIN_ECHO = 18;
+const int PIN_OK_LED      = 25;   // green
+const int PIN_COLLECT_LED = 26;   // red
+
+=====PAGE 87=====
+// ---------- Identity (Section 5 of the spec) ----------
+const char* SCHEMA_VERSION = "1.0";
+const char* CAMPUS_ID      = "CHRIST-DEMO";
+const char* MODULE_NAME    = "waste";
+const char* BUILDING_ID    = "BLOCKA";
+const char* ZONE_ID        = "BIN-1";
+const char* DEVICE_ID      = "WASTE-A-ESP32-01";
+const char* TOPIC_BASE     = "christ-smart-campus/v1/waste/block-a/WASTE-A-ESP32-
+01";
+// ---------- Network ----------
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+// Must be the SAME broker the dashboard server uses (public broker: synthetic 
+data only).
+const char* MQTT_HOST = "broker.hivemq.com";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+// ---------- Calibration (sensor mounted under the lid of the miniature bin) ---
+-------
+const float EMPTY_CM = 50.0;    // distance to the bottom when the bin is empty = 
+0 %
+const float FULL_CM  = 5.0;     // distance to the waste when the bin is full   = 
+100 %
+const float OBSTRUCT_CM = 3.5;  // closer than this = something is blocking the 
+sensor (obstruction)
+const float MAX_VALID_CM = EMPTY_CM + 15.0;   // farther than this is not a bin 
+reading (e.g. Wokwi's default 400 cm) = invalid
+const float COLLECT_ON_PCT  = 80.0;   // collection_required above this 
+(configurable)
+const float COLLECT_OFF_PCT = 70.0;   // clears below this (bin emptied) - 
+hysteresis
+const int   INVALID_LIMIT   = 3;      // consecutive bad readings before an alert
+// Test switch for D9 (invalid reading): true = pretend the sensor is dead
+const bool TEST_FORCE_SENSOR_FAULT = false;
+// Live updates: publish when the fill level moves by this much (at most once per 
+FILL_MIN_MS)
+const float FILL_DELTA_PCT = 2.0;
+const unsigned long FILL_MIN_MS = 1000;
+
+=====PAGE 88=====
+// ---------- Timing ----------
+const unsigned long READ_MS      = 300;
+const unsigned long PUBLISH_MS   = 5000;
+const unsigned long HEARTBEAT_MS = 30000;
+const unsigned long RECONNECT_MS = 5000;
+const unsigned long STATUS_MS    = 10000;
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+char topicTelemetry[128], topicStatus[128], topicAlerts[128], clientId[40];
+bool sensorFault = false, obstructed = false, collect = false, haveFill = false;
+int invalidCount = 0, obstructCount = 0;
+float distanceCm = -1, fillPct = 0, pubPct = -1000;
+unsigned long pubMs = 0, lastRead = 0, lastPublish = 0, lastBeat = 0, lastTry = 
+0, lastStatus = 0;
+// Alerts are retried until delivered, so a dropped connection cannot leave an 
+alert stuck on the dashboard.
+enum { A_FAULT = 0, A_OBSTRUCT = 1, A_COLLECT = 2, N_ALERTS = 3 };
+struct AlertSlot { const char* metric; const char* activeStatus; bool pending; 
+bool value; };
+AlertSlot alerts[N_ALERTS] = {
+  {"sensor_fault",        "fault",   false, false},
+  {"obstruction",         "warning", false, false},
+  {"collection_required", "warning", false, false}
+};
+// ---------- Helpers ----------
+bool nowIso(char* buf, size_t n) {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+  strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &t);
+  return true;
+}
+// value must already be a valid JSON literal: 55.0, true, false
+bool publishMetric(const char* topic, const char* metric, const char* value,
+                   const char* unit, const char* status, bool retained = false) {
+  char ts[25];
+  if (!nowIso(ts, sizeof(ts)) || !mqtt.connected()) return false;
+  char payload[400];
+  snprintf(payload, sizeof(payload),
+
+=====PAGE 89=====
+    
+"{\"schema_version\":\"%s\",\"campus_id\":\"%s\",\"module\":\"%s\",\"building_id\
+":\"%s\","
+    
+"\"zone_id\":\"%s\",\"device_id\":\"%s\",\"timestamp\":\"%s\",\"metric\":\"%s\","
+    "\"value\":%s,\"unit\":\"%s\",\"status\":\"%s\"}",
+    SCHEMA_VERSION, CAMPUS_ID, MODULE_NAME, BUILDING_ID, ZONE_ID, DEVICE_ID, ts, 
+metric, value, unit, status);
+  bool ok = mqtt.publish(topic, payload, retained);
+  Serial.println(payload);
+  return ok;
+}
+void publishFill() {
+  char b[16]; snprintf(b, sizeof(b), "%.1f", fillPct);
+  if (publishMetric(topicTelemetry, "bin_fill_pct", b, "%", collect ? "warning" : 
+"normal")) {
+    pubPct = fillPct; pubMs = millis();
+  }
+}
+void publishCollect() {
+  publishMetric(topicTelemetry, "collection_required", collect ? "true" : 
+"false", "bool", collect ? "warning" : "normal");
+}
+void queueAlert(int k, bool v) { alerts[k].pending = true; alerts[k].value = v; }
+void flushAlerts() {
+  for (int k = 0; k < N_ALERTS; k++) {
+    if (!alerts[k].pending) continue;
+    bool v = alerts[k].value;
+    if (publishMetric(topicAlerts, alerts[k].metric, v ? "true" : "false", 
+"bool", v ? alerts[k].activeStatus : "normal"))
+      alerts[k].pending = false;
+  }
+}
+void setFault(bool v) {
+  if (v == sensorFault) return;
+  sensorFault = v;
+  if (v) Serial.println("ALERT: bin sensor fault (no echo, or distance outside 
+the bin range)");
+  queueAlert(A_FAULT, v); flushAlerts();
+}
+void setObstructed(bool v) {
+
+=====PAGE 90=====
+  if (v == obstructed) return;
+  obstructed = v;
+  if (v) Serial.println("ALERT: obstruction - something is blocking the sensor");
+  queueAlert(A_OBSTRUCT, v); flushAlerts();
+}
+// ---------- Sensor ----------
+float readDistanceCm() {
+  if (TEST_FORCE_SENSOR_FAULT) return -1;
+  digitalWrite(PIN_TRIG, LOW);  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  unsigned long us = pulseIn(PIN_ECHO, HIGH, 30000);
+  if (us == 0) return -1;                       // no echo
+  return us * 0.0343 / 2.0;
+}
+float toPercent(float cm) {
+  float p = (EMPTY_CM - cm) / (EMPTY_CM - FULL_CM) * 100.0;
+  if (p < 0) p = 0;
+  if (p > 100) p = 100;
+  return p;
+}
+void measure() {
+  float cm = readDistanceCm();
+  bool noEcho = cm < 0;
+  bool tooFar = !noEcho && cm > MAX_VALID_CM;
+  bool tooClose = !noEcho && cm < OBSTRUCT_CM;
+  if (noEcho || tooFar) {                        // invalid reading
+    obstructCount = 0;
+    if (++invalidCount >= INVALID_LIMIT) { setObstructed(false); setFault(true); 
+}
+    return;
+  }
+  if (tooClose) {                                // obstruction
+    invalidCount = 0;
+    if (++obstructCount >= INVALID_LIMIT) { setFault(false); setObstructed(true); 
+}
+    return;
+  }
+  // valid reading
+
+=====PAGE 91=====
+  invalidCount = 0; obstructCount = 0;
+  setFault(false); setObstructed(false);
+  distanceCm = cm;
+  fillPct = toPercent(cm);
+  haveFill = true;
+  if (!collect && fillPct > COLLECT_ON_PCT) {    // collection_required with 
+hysteresis
+    collect = true;
+    Serial.println("ALERT: collection required");
+    queueAlert(A_COLLECT, true); flushAlerts();
+    publishCollect();
+  } else if (collect && fillPct < COLLECT_OFF_PCT) {
+    collect = false;
+    queueAlert(A_COLLECT, false); flushAlerts();
+    publishCollect();
+  }
+}
+void updateLeds() {
+  bool blink = (millis() / 250) % 2;
+  if (sensorFault || obstructed) {               // red blinks, green off
+    digitalWrite(PIN_COLLECT_LED, blink);
+    digitalWrite(PIN_OK_LED, LOW);
+  } else {
+    digitalWrite(PIN_COLLECT_LED, collect);      // red solid = collection 
+required
+    digitalWrite(PIN_OK_LED, haveFill && !collect);   // green = bin has space
+  }
+}
+// ---------- Network (non-blocking: local logic keeps running offline) ---------
+-
+void keepConnected() {
+  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
+  if (millis() - lastTry < RECONNECT_MS) return;
+  lastTry = millis();
+  bool ok = (strlen(MQTT_USER) > 0) ? mqtt.connect(clientId, MQTT_USER, 
+MQTT_PASS) : mqtt.connect(clientId);
+  if (ok) {
+    Serial.println("MQTT connected");
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+  } else {
+    Serial.printf("MQTT connect failed, state=%d\n", mqtt.state());
+
+=====PAGE 92=====
+  }
+}
+// Messages are silently skipped until Wi-Fi, MQTT and the clock are all ready; 
+this line shows which one is missing.
+void statusLine() {
+  struct tm t;
+  Serial.printf("[status] wifi=%s mqtt=%s time=%s | distance=%.1f cm 
+fill=%.1f%%\n",
+    WiFi.status() == WL_CONNECTED ? "OK" : "NO",
+    mqtt.connected() ? "OK" : "NO",
+    getLocalTime(&t, 0) ? "OK" : "NO",
+    distanceCm, fillPct);
+}
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_OK_LED, OUTPUT);
+  pinMode(PIN_COLLECT_LED, OUTPUT);
+  snprintf(topicTelemetry, sizeof(topicTelemetry), "%s/telemetry", TOPIC_BASE);
+  snprintf(topicStatus,    sizeof(topicStatus),    "%s/status",    TOPIC_BASE);
+  snprintf(topicAlerts,    sizeof(topicAlerts),    "%s/alerts",    TOPIC_BASE);
+  snprintf(clientId, sizeof(clientId), "%s-%04X", DEVICE_ID, 
+(uint16_t)esp_random());
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+  configTime(0, 0, "pool.ntp.org");        // UTC timestamps
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);                 // default 256 is too small for the 
+JSON
+  mqtt.setSocketTimeout(5);                // do not freeze the loop when the 
+broker is unreachable
+}
+void loop() {
+  keepConnected();
+  mqtt.loop();
+  if (millis() - lastRead >= READ_MS) { lastRead = millis(); measure(); }
+  updateLeds();
+  // live fill update between the periodic ones
+
+=====PAGE 93=====
+  if (haveFill && !sensorFault && !obstructed && fabs(fillPct - pubPct) >= 
+FILL_DELTA_PCT && millis() - pubMs >= FILL_MIN_MS) publishFill();
+  if (millis() - lastStatus >= STATUS_MS) { lastStatus = millis(); statusLine(); 
+}
+  if (millis() - lastPublish >= PUBLISH_MS) {
+    lastPublish = millis();
+    flushAlerts();
+    if (haveFill && !sensorFault && !obstructed) { publishFill(); 
+publishCollect(); }
+  }
+  if (millis() - lastBeat >= HEARTBEAT_MS) {
+    lastBeat = millis();
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+  }
+}
+Distance 50cm
+
+=====PAGE 94=====
+
+=====PAGE 95=====
+Distance 27cm
+
+=====PAGE 96=====
+
+=====PAGE 97=====
+Distance 13cm
+
+=====PAGE 98=====
+Distance 17cm
+
+=====PAGE 99=====
+Distance 19 cm
+
+=====PAGE 100=====
+Distance 5 cm
+
+=====PAGE 101=====
+Distance 2cm (Blinking LED)
+
+=====PAGE 102=====
+Distance 400cm
+
+=====PAGE 103=====
+
+=====PAGE 104=====
+Distance 27cm
+
+=====PAGE 105=====
+Simulating BIN2
+
+=====PAGE 106=====
+Simulate bin3
+
+=====PAGE 107=====
+Module 5 Block Diagram:
+
+=====PAGE 108=====
+Module 6:
+Code:
+/*
+  CHRIST Smart Campus - Module 6: Campus Safety   (DEMONSTRATION ONLY)
+  Device: SAFE-A-ESP32-01  |  Wokwi ESP32 DevKit C v4
+*/
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
+#include <math.h>
+// ---------- Pins ----------
+const int PIN_NTC    = 34;   // ADC1
+const int PIN_GAS    = 35;   // ADC1
+const int PIN_EVENT  = 27;
+const int PIN_RESET  = 14;
+
+=====PAGE 109=====
+const int PIN_BUZZER = 25;
+const int PIN_LED    = 26;
+// ---------- Identity (Section 5 of the spec) ----------
+const char* SCHEMA_VERSION = "1.0";
+const char* CAMPUS_ID      = "CHRIST-DEMO";
+const char* MODULE_NAME    = "safety";
+const char* BUILDING_ID    = "BLOCKA";
+const char* ZONE_ID        = "LAB-101";
+const char* DEVICE_ID      = "SAFE-A-ESP32-01";
+const char* TOPIC_BASE     = "christ-smart-campus/v1/safety/block-a/SAFE-A-ESP32-
+01";
+// ---------- Network ----------
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+// Must be the SAME broker the dashboard server uses (public broker: synthetic 
+data only).
+const char* MQTT_HOST = "broker.hivemq.com";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+// ---------- Thresholds ----------
+const float TEMP_ON_C  = 50.0;   // high-temperature alarm above this
+const float TEMP_OFF_C = 45.0;   // clears below this (hysteresis)
+// Gas alarm works relative to a clean-air baseline measured in the first seconds 
+after power-up
+// (keep the gas sensor at its normal/clean value while the sketch starts).
+const float GAS_RISE_ON_PCT  = 10.0;  // alarm when the gas level rises this many 
+points above the baseline
+const float GAS_RISE_OFF_PCT = 5.0;   // clears when it is back within this many 
+points of the baseline
+const unsigned long BASELINE_MS = 3000;
+const float BETA = 3950.0;       // NTC beta value (Wokwi NTC module)
+const int   INVALID_LIMIT = 3;   // consecutive invalid temperature readings = 
+sensor fault
+const unsigned long LONG_PRESS_MS = 3000;   // hold the reset button this long to 
+toggle the simulated network loss
+const bool TEST_FORCE_SENSOR_FAULT = false;  // true = pretend the temperature 
+sensor is dead (D9)
+const bool DEBUG_PRINT_SENSORS = true;       // prints temp and gas every 2 s
+
+=====PAGE 110=====
+// Live updates: publish when a value moves by this much (at most once per 
+LIVE_MIN_MS)
+const float TEMP_DELTA_C = 0.5, GAS_DELTA_PCT = 2.0;
+const unsigned long LIVE_MIN_MS = 1000;
+// ---------- Timing ----------
+const unsigned long READ_MS      = 300;
+const unsigned long PUBLISH_MS   = 5000;
+const unsigned long HEARTBEAT_MS = 30000;
+const unsigned long RECONNECT_MS = 5000;
+const unsigned long STATUS_MS    = 10000;
+const unsigned long DEBUG_MS     = 2000;
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+char topicTelemetry[128], topicStatus[128], topicAlerts[128], clientId[40];
+float tempC = NAN, gasPct = 0, pubTemp = -1000, pubGas = -1000;
+float gasBaseline = -1, gasOnPct = 101, gasOffPct = 101, baseSum = 0;
+int baseN = 0;
+int gasRaw = 0, invalidCount = 0;
+bool haveTemp = false, tempHigh = false, gasHigh = false, manualEvent = false;
+bool smokeActive = false, tempActive = false, sensorFault = false, networkOn = 
+true;
+int repeatCount = 0;
+unsigned long lastRead = 0, lastPublish = 0, lastBeat = 0, lastTry = 0, 
+lastStatus = 0, lastDebug = 0;
+unsigned long pubTempMs = 0, pubGasMs = 0, lastBuzzUs = 0;
+bool buzzLevel = false;
+int lastEvt = HIGH, lastRst = HIGH;
+unsigned long lastEvtMs = 0, lastRstMs = 0, rstDownMs = 0;
+// Alerts are retried until delivered, so a network loss cannot lose an alarm: it 
+is sent when the link returns.
+enum { A_SMOKE = 0, A_TEMP = 1, A_FAULT = 2, N_ALERTS = 3 };
+struct AlertSlot { const char* metric; const char* activeStatus; bool pending; 
+bool value; };
+AlertSlot alerts[N_ALERTS] = {
+  {"smoke_detected",  "critical", false, false},
+  {"high_temperature", "critical", false, false},
+  {"sensor_fault",    "fault",    false, false}
+};
+// ---------- Helpers ----------
+
+=====PAGE 111=====
+bool nowIso(char* buf, size_t n) {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+  strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &t);
+  return true;
+}
+// value must already be a valid JSON literal: 24.0, true, false
+bool publishMetric(const char* topic, const char* metric, const char* value,
+                   const char* unit, const char* status, bool retained = false) {
+  char ts[25];
+  if (!nowIso(ts, sizeof(ts)) || !mqtt.connected()) return false;
+  char payload[400];
+  snprintf(payload, sizeof(payload),
+    
+"{\"schema_version\":\"%s\",\"campus_id\":\"%s\",\"module\":\"%s\",\"building_id\
+":\"%s\","
+    
+"\"zone_id\":\"%s\",\"device_id\":\"%s\",\"timestamp\":\"%s\",\"metric\":\"%s\","
+    "\"value\":%s,\"unit\":\"%s\",\"status\":\"%s\"}",
+    SCHEMA_VERSION, CAMPUS_ID, MODULE_NAME, BUILDING_ID, ZONE_ID, DEVICE_ID, ts, 
+metric, value, unit, status);
+  bool ok = mqtt.publish(topic, payload, retained);
+  Serial.println(payload);
+  return ok;
+}
+void publishTemp() {
+  char b[16]; snprintf(b, sizeof(b), "%.1f", tempC);
+  if (publishMetric(topicTelemetry, "temperature", b, "C", tempHigh ? "warning" : 
+"normal")) { pubTemp = tempC; pubTempMs = millis(); }
+}
+void publishGas() {
+  char b[16]; snprintf(b, sizeof(b), "%.1f", gasPct);
+  if (publishMetric(topicTelemetry, "gas_level_pct", b, "%", gasHigh ? "warning" 
+: "normal")) { pubGas = gasPct; pubGasMs = millis(); }
+}
+void publishSmoke() {
+  publishMetric(topicTelemetry, "smoke_detected", smokeActive ? "true" : "false", 
+"bool", smokeActive ? "critical" : "normal");
+}
+void queueAlert(int k, bool v) { alerts[k].pending = true; alerts[k].value = v; }
+void flushAlerts() {
+
+=====PAGE 112=====
+  for (int k = 0; k < N_ALERTS; k++) {
+    if (!alerts[k].pending) continue;
+    bool v = alerts[k].value;
+    if (publishMetric(topicAlerts, alerts[k].metric, v ? "true" : "false", 
+"bool", v ? alerts[k].activeStatus : "normal"))
+      alerts[k].pending = false;
+  }
+}
+// ---------- Sensors ----------
+float readTempC() {                             // NAN = invalid reading
+  if (TEST_FORCE_SENSOR_FAULT) return NAN;
+  long sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogRead(PIN_NTC);
+  float raw = sum / 8.0;
+  if (raw < 20 || raw > 4075) return NAN;       // open / shorted sensor
+  return 1.0 / (log(1.0 / (4095.0 / raw - 1.0)) / BETA + 1.0 / 298.15) - 273.15;
+}
+float readGasPct() {
+  long sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogRead(PIN_GAS);
+  gasRaw = sum / 8;
+  return gasRaw / 4095.0 * 100.0;
+}
+// ---------- Alarm logic ----------
+void checkAlarms() {
+  if ((gasHigh || manualEvent) && !smokeActive) {         // latched until reset
+    smokeActive = true;
+    Serial.println("ALARM: smoke / gas event");
+    queueAlert(A_SMOKE, true); flushAlerts(); publishSmoke();
+  }
+  if (tempHigh && !tempActive) {
+    tempActive = true;
+    Serial.println("ALARM: high temperature");
+    queueAlert(A_TEMP, true); flushAlerts();
+  }
+}
+void evaluate() {
+  float t = readTempC();
+  if (isnan(t)) {
+    if (++invalidCount >= INVALID_LIMIT && !sensorFault) {
+
+=====PAGE 113=====
+      sensorFault = true;
+      Serial.println("ALERT: temperature sensor fault");
+      queueAlert(A_FAULT, true); flushAlerts();
+    }
+  } else {
+    invalidCount = 0;
+    if (sensorFault) { sensorFault = false; queueAlert(A_FAULT, false); 
+flushAlerts(); }
+    tempC = t; haveTemp = true;
+    if (!tempHigh && tempC > TEMP_ON_C) tempHigh = true;
+    else if (tempHigh && tempC < TEMP_OFF_C) tempHigh = false;
+  }
+  gasPct = readGasPct();
+  if (gasBaseline < 0) {                                    // learning the 
+clean-air baseline
+    baseSum += gasPct; baseN++;
+    if (millis() >= BASELINE_MS) {
+      gasBaseline = baseSum / baseN;
+      gasOnPct  = fminf(gasBaseline + GAS_RISE_ON_PCT, 99.0f);
+      gasOffPct = gasOnPct - (GAS_RISE_ON_PCT - GAS_RISE_OFF_PCT);
+      Serial.printf("Gas baseline = %.1f%%  -> alarm above %.1f%%, clears below 
+%.1f%%\n", gasBaseline, gasOnPct, gasOffPct);
+      if (gasBaseline + GAS_RISE_ON_PCT > 99.0) Serial.println("WARNING: little 
+headroom above the baseline. Try powering the MQ-2 from 3V3.");
+    }
+  } else {
+    if (!gasHigh && gasPct > gasOnPct) gasHigh = true;
+    else if (gasHigh && gasPct < gasOffPct) gasHigh = false;
+  }
+  checkAlarms();
+}
+void onEvent() {                                          // green button: 
+simulated smoke event
+  if (smokeActive || manualEvent) {
+    repeatCount++;
+    Serial.printf("Repeat event ignored (alarm already active), repeats=%d\n", 
+repeatCount);
+    return;
+  }
+  manualEvent = true;
+  checkAlarms();
+
+=====PAGE 114=====
+}
+void onReset() {                                          // blue button, short 
+press
+  if (!smokeActive && !tempActive) { Serial.println("Reset: nothing to reset"); 
+return; }
+  if (gasHigh || tempHigh) { Serial.println("Reset refused: the condition is 
+still present"); return; }
+  manualEvent = false; repeatCount = 0;
+  if (smokeActive) { smokeActive = false; queueAlert(A_SMOKE, false); }
+  if (tempActive)  { tempActive = false;  queueAlert(A_TEMP, false); }
+  flushAlerts(); publishSmoke();
+  Serial.println("Reset: alarm cleared");
+}
+void setNetwork(bool on) {                                // test input: 
+simulated network loss
+  networkOn = on;
+  Serial.println(on ? "TEST: network ON" : "TEST: network OFF (simulated loss, 
+local alarm keeps working)");
+  if (!on) mqtt.disconnect();
+}
+void checkButtons() {
+  int e = digitalRead(PIN_EVENT);
+  if (e != lastEvt && millis() - lastEvtMs > 30) {
+    lastEvtMs = millis(); lastEvt = e;
+    if (e == LOW) onEvent();
+  }
+  int r = digitalRead(PIN_RESET);
+  if (r != lastRst && millis() - lastRstMs > 30) {
+    lastRstMs = millis(); lastRst = r;
+    if (r == LOW) rstDownMs = millis();
+    else if (millis() - rstDownMs >= LONG_PRESS_MS) setNetwork(!networkOn);   // 
+long press
+    else onReset();                                                          // 
+short press
+  }
+}
+void updateOutputs() {
+  bool alarm = smokeActive || tempActive;
+  if (alarm) digitalWrite(PIN_LED, HIGH);                                   // 
+solid = alarm
+
+=====PAGE 115=====
+  else if (sensorFault) digitalWrite(PIN_LED, (millis() / 500) % 2);        // 
+slow blink = sensor fault
+  else digitalWrite(PIN_LED, LOW);
+  bool beep = alarm && ((millis() / 300) % 2 == 0);                         // 
+300 ms on / 300 ms off
+  if (beep) {
+    if (micros() - lastBuzzUs >= 500) {                                     // 
+about 1 kHz tone
+      lastBuzzUs = micros(); buzzLevel = !buzzLevel; digitalWrite(PIN_BUZZER, 
+buzzLevel);
+    }
+  } else digitalWrite(PIN_BUZZER, LOW);
+}
+// ---------- Network (non-blocking: the local alarm keeps working offline) -----
+-----
+void keepConnected() {
+  if (!networkOn || WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
+  if (millis() - lastTry < RECONNECT_MS) return;
+  lastTry = millis();
+  bool ok = (strlen(MQTT_USER) > 0) ? mqtt.connect(clientId, MQTT_USER, 
+MQTT_PASS) : mqtt.connect(clientId);
+  if (ok) {
+    Serial.println("MQTT connected");
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+  } else {
+    Serial.printf("MQTT connect failed, state=%d\n", mqtt.state());
+  }
+}
+// Messages are silently skipped until Wi-Fi, MQTT and the clock are all ready; 
+this line shows which one is missing.
+void statusLine() {
+  struct tm t;
+  Serial.printf("[status] wifi=%s mqtt=%s time=%s network_test=%s\n",
+    WiFi.status() == WL_CONNECTED ? "OK" : "NO",
+    mqtt.connected() ? "OK" : "NO",
+    getLocalTime(&t, 0) ? "OK" : "NO",
+    networkOn ? "on" : "OFF");
+}
+void setup() {
+  Serial.begin(115200);
+
+=====PAGE 116=====
+  pinMode(PIN_EVENT, INPUT_PULLUP);
+  pinMode(PIN_RESET, INPUT_PULLUP);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED, OUTPUT);
+  snprintf(topicTelemetry, sizeof(topicTelemetry), "%s/telemetry", TOPIC_BASE);
+  snprintf(topicStatus,    sizeof(topicStatus),    "%s/status",    TOPIC_BASE);
+  snprintf(topicAlerts,    sizeof(topicAlerts),    "%s/alerts",    TOPIC_BASE);
+  snprintf(clientId, sizeof(clientId), "%s-%04X", DEVICE_ID, 
+(uint16_t)esp_random());
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+  configTime(0, 0, "pool.ntp.org");        // UTC timestamps
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);                 // default 256 is too small for the 
+JSON
+  mqtt.setSocketTimeout(5);                // do not freeze the loop when the 
+broker is unreachable
+}
+void loop() {
+  keepConnected();
+  mqtt.loop();
+  checkButtons();
+  if (millis() - lastRead >= READ_MS) { lastRead = millis(); evaluate(); }
+  updateOutputs();
+  // live updates between the periodic ones
+  if (haveTemp && !sensorFault && fabs(tempC - pubTemp) >= TEMP_DELTA_C && 
+millis() - pubTempMs >= LIVE_MIN_MS) publishTemp();
+  if (fabs(gasPct - pubGas) >= GAS_DELTA_PCT && millis() - pubGasMs >= 
+LIVE_MIN_MS) publishGas();
+  if (DEBUG_PRINT_SENSORS && millis() - lastDebug >= DEBUG_MS) {
+    lastDebug = millis();
+    Serial.printf("[sensors] temp=%.1f C  gas=%.1f%% (raw %d)  alarm=%d\n", 
+tempC, gasPct, gasRaw, (int)(smokeActive || tempActive));
+  }
+  if (millis() - lastStatus >= STATUS_MS) { lastStatus = millis(); statusLine(); 
+}
+  if (millis() - lastPublish >= PUBLISH_MS) {
+    lastPublish = millis();
+    flushAlerts();
+    if (haveTemp && !sensorFault) publishTemp();
+
+=====PAGE 117=====
+    publishGas();
+    publishSmoke();
+  }
+  if (millis() - lastBeat >= HEARTBEAT_MS) {
+    lastBeat = millis();
+    publishMetric(topicStatus, "device_online", "true", "bool", "normal", true);
+  }
+}
+
+=====PAGE 118=====
+24 c with gas at 400 ppm
+
+=====PAGE 119=====
+
+=====PAGE 120=====
+Alarm
+
+=====PAGE 121=====
+Repeat event ignored
+
+=====PAGE 122=====
+
+=====PAGE 123=====
+Alarm Acknowledged as Operator
+
+=====PAGE 124=====
+
+=====PAGE 125=====
+Alert Resolved
+
+=====PAGE 126=====
+Active Alarm At high gas level
+
+=====PAGE 127=====
+Reset Refused on High gas level
+
+=====PAGE 128=====
+
+=====PAGE 129=====
+High Temprature Alert
+
+=====PAGE 130=====
+
+=====PAGE 131=====
+Network OFF Scenario
+
+=====PAGE 132=====
+
+=====PAGE 133=====
+
+=====PAGE 134=====
+Network ON again and dashboard receive the alert automatically
+
+=====PAGE 135=====
+TEST_FORCE_SENSOR_FAULT = true (sensor fault, LED blinking)
+
+=====PAGE 136=====
+
+=====PAGE 137=====
+
+=====PAGE 138=====
+Module 6 Block Diagram
+
+=====PAGE 139=====
+Links:
+Wokwi Project Links:
+Module 1: https://wokwi.com/projects/480180098834231297
+Module 2: https://wokwi.com/projects/480188099032470529
+Module 3: https://wokwi.com/projects/480396928403601409
+Module 4: https://wokwi.com/projects/480460219960602625
+Module 5: https://wokwi.com/projects/480462153809318913
+Module 6: https://wokwi.com/projects/480490262108451841
+GitHub Project Link: https://github.com/Dazai-
+arch/IOT_SMART_CAMPUS_AUTOMATION
+Deployed Project Dashboard Link: https://iot-smart-campus-
+automation.onrender.com/
+Deployed on render
+ 

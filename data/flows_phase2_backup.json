@@ -1,0 +1,304 @@
+[
+    {
+        "id": "tab_main",
+        "type": "tab",
+        "label": "CHRIST Smart Campus - Phase 2",
+        "disabled": false,
+        "info": ""
+    },
+    {
+        "id": "broker",
+        "type": "mqtt-broker",
+        "name": "Local Mosquitto",
+        "broker": "127.0.0.1",
+        "port": "1883",
+        "clientid": "nodered-ingest",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true
+    },
+    {
+        "id": "db",
+        "type": "sqlitedb",
+        "db": "data/campus.db",
+        "mode": "RWC"
+    },
+    {
+        "id": "ui_tab",
+        "type": "ui_tab",
+        "name": "Campus",
+        "icon": "dashboard",
+        "order": 1
+    },
+    {
+        "id": "ui_grp",
+        "type": "ui_group",
+        "name": "Latest reading",
+        "tab": "ui_tab",
+        "order": 1,
+        "disp": true,
+        "width": "12",
+        "collapse": false
+    },
+    {
+        "id": "357c2785c4af0802",
+        "type": "ui_base",
+        "theme": {
+            "name": "theme-light",
+            "lightTheme": {
+                "default": "#0094CE",
+                "baseColor": "#0094CE",
+                "baseFont": "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Oxygen-Sans,Ubuntu,Cantarell,Helvetica Neue,sans-serif",
+                "edited": false
+            },
+            "darkTheme": {
+                "default": "#097479",
+                "baseColor": "#097479",
+                "baseFont": "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Oxygen-Sans,Ubuntu,Cantarell,Helvetica Neue,sans-serif",
+                "edited": false
+            },
+            "customTheme": {
+                "name": "Untitled Theme 1",
+                "default": "#4B7930",
+                "baseColor": "#4B7930",
+                "baseFont": "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Oxygen-Sans,Ubuntu,Cantarell,Helvetica Neue,sans-serif"
+            },
+            "themeState": {
+                "base-color": {
+                    "default": "#0094CE",
+                    "value": "#0094CE",
+                    "edited": false
+                },
+                "page-titlebar-backgroundColor": {
+                    "value": "#0094CE",
+                    "edited": false
+                },
+                "page-backgroundColor": {
+                    "value": "#fafafa",
+                    "edited": false
+                },
+                "page-sidebar-backgroundColor": {
+                    "value": "#ffffff",
+                    "edited": false
+                },
+                "group-textColor": {
+                    "value": "#1bbfff",
+                    "edited": false
+                },
+                "group-borderColor": {
+                    "value": "#ffffff",
+                    "edited": false
+                },
+                "group-backgroundColor": {
+                    "value": "#ffffff",
+                    "edited": false
+                },
+                "widget-textColor": {
+                    "value": "#111111",
+                    "edited": false
+                },
+                "widget-backgroundColor": {
+                    "value": "#0094ce",
+                    "edited": false
+                },
+                "widget-borderColor": {
+                    "value": "#ffffff",
+                    "edited": false
+                },
+                "base-font": {
+                    "value": "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Oxygen-Sans,Ubuntu,Cantarell,Helvetica Neue,sans-serif"
+                }
+            },
+            "angularTheme": {
+                "primary": "indigo",
+                "accents": "blue",
+                "warn": "red",
+                "background": "grey",
+                "palette": "light"
+            }
+        },
+        "site": {
+            "name": "Node-RED Dashboard",
+            "hideToolbar": "false",
+            "allowSwipe": "false",
+            "lockMenu": "false",
+            "allowTempTheme": "true",
+            "dateFormat": "DD/MM/YYYY",
+            "sizes": {
+                "sx": 48,
+                "sy": 48,
+                "gx": 6,
+                "gy": 6,
+                "cx": 6,
+                "cy": 6,
+                "px": 0,
+                "py": 0
+            }
+        }
+    },
+    {
+        "id": "mqin",
+        "type": "mqtt in",
+        "z": "tab_main",
+        "name": "all telemetry",
+        "topic": "christ-smart-campus/v1/+/+/+/telemetry",
+        "qos": "1",
+        "datatype": "utf8",
+        "broker": "broker",
+        "inputs": 0,
+        "x": 220,
+        "y": 240,
+        "wires": [
+            [
+                "validate"
+            ]
+        ]
+    },
+    {
+        "id": "validate",
+        "type": "function",
+        "z": "tab_main",
+        "name": "validate (FR-02)",
+        "func": "// FR-02 validation. Output 1 = valid reading, output 2 = rejected (with reason).\nconst REQ = [\"schema_version\",\"campus_id\",\"module\",\"building_id\",\"zone_id\",\n             \"device_id\",\"timestamp\",\"metric\",\"value\",\"unit\",\"status\"];\nconst MODULES = [\"classroom\",\"parking\",\"energy\",\"water\",\"waste\",\"safety\"];\n// Registry of known devices (Phase 2: hard-coded; Phase 6: table in SQLite)\nconst DEVICES = [\"CLASS-A-ESP32-01\"];\n// Allowed numeric range per metric -> out-of-range values are flagged\nconst RANGE = {temperature:[-10,60], light_level:[0,100], occupancy_count:[0,500],\n               co2_ppm:[250,5000], power_w:[0,5000], energy_kwh:[0,100000],\n               tank_level_pct:[0,100], bin_fill_pct:[0,100], water_flow_lpm:[0,200]};\nconst BOOLS = [\"occupancy_detected\",\"slot_occupied\",\"smoke_detected\",\"device_online\"];\n\nconst raw = (msg.payload === undefined || msg.payload === null) ? \"\" : msg.payload.toString();\nfunction reject(reason) {\n    return [null, {params: {$ts: new Date().toISOString(), $topic: msg.topic,\n                            $reason: reason, $raw: raw.substring(0, 500)}}];\n}\nlet p;\ntry { p = JSON.parse(raw); } catch (e) { return reject(\"malformed_json\"); }\nif (typeof p !== \"object\" || p === null || Array.isArray(p)) return reject(\"malformed_json\");\nfor (const k of REQ) if (p[k] === undefined || p[k] === null || p[k] === \"\") return reject(\"missing_field:\" + k);\nif (!MODULES.includes(p.module)) return reject(\"unknown_module:\" + p.module);\nif (!DEVICES.includes(p.device_id)) return reject(\"unknown_device:\" + p.device_id);\n// Topic must agree with payload, otherwise a device could spoof another one\nconst t = msg.topic.split(\"/\"); // [christ-smart-campus, v1, module, building, device, kind]\nif (t[2] !== p.module || t[3] !== p.building_id || t[4] !== p.device_id)\n    return reject(\"topic_payload_mismatch\");\n// ISO 8601 with explicit timezone (Z or +hh:mm)\nif (!/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$/.test(p.timestamp) ||\n    isNaN(Date.parse(p.timestamp))) return reject(\"invalid_timestamp\");\nif (BOOLS.includes(p.metric)) {\n    if (typeof p.value !== \"boolean\") return reject(\"wrong_type:\" + p.metric);\n} else if (RANGE[p.metric]) {\n    if (typeof p.value !== \"number\" || !isFinite(p.value)) return reject(\"wrong_type:\" + p.metric);\n    if (p.value < RANGE[p.metric][0] || p.value > RANGE[p.metric][1]) return reject(\"out_of_range:\" + p.metric);\n} else return reject(\"unknown_metric:\" + p.metric);\n\nconst valNum = typeof p.value === \"boolean\" ? (p.value ? 1 : 0) : p.value;\nmsg.reading = p;   // keep for the dashboard branch\nmsg.params = {$ts: p.timestamp, $rx: new Date().toISOString(), $module: p.module,\n              $building: p.building_id, $zone: p.zone_id, $device: p.device_id,\n              $metric: p.metric, $value: valNum, $unit: p.unit, $status: p.status,\n              $source: p.source || \"unknown\"};\nreturn [msg, null];",
+        "outputs": 2,
+        "x": 440,
+        "y": 240,
+        "wires": [
+            [
+                "ins_read",
+                "latest"
+            ],
+            [
+                "ins_rej",
+                "dbg"
+            ]
+        ]
+    },
+    {
+        "id": "ins_read",
+        "type": "sqlite",
+        "z": "tab_main",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "INSERT INTO readings (ts,rx,module,building,zone,device,metric,value,unit,status,source) VALUES ($ts,$rx,$module,$building,$zone,$device,$metric,$value,$unit,$status,$source);",
+        "name": "store reading",
+        "x": 680,
+        "y": 200,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "ins_rej",
+        "type": "sqlite",
+        "z": "tab_main",
+        "mydb": "db",
+        "sqlquery": "prepared",
+        "sql": "INSERT INTO rejects (ts,topic,reason,raw) VALUES ($ts,$topic,$reason,$raw);",
+        "name": "store reject",
+        "x": 680,
+        "y": 300,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "latest",
+        "type": "function",
+        "z": "tab_main",
+        "name": "format latest",
+        "func": "// Bare dashboard: show last reading text. (Phase 6 replaces this with tables/filters.)\nconst r = msg.reading;\nmsg.payload = r.device_id + \" | \" + r.metric + \" = \" + r.value + \" \" + r.unit +\n              \" | \" + r.status + \" | \" + r.timestamp + (r.source === \"simulated\" ? \"  [SIMULATED]\" : \"\");\nreturn msg;",
+        "outputs": 1,
+        "x": 680,
+        "y": 250,
+        "wires": [
+            [
+                "ui_latest"
+            ]
+        ]
+    },
+    {
+        "id": "ui_latest",
+        "type": "ui_text",
+        "z": "tab_main",
+        "group": "ui_grp",
+        "order": 1,
+        "width": 0,
+        "height": 0,
+        "name": "",
+        "label": "Last valid",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "x": 900,
+        "y": 250,
+        "wires": []
+    },
+    {
+        "id": "init",
+        "type": "inject",
+        "z": "tab_main",
+        "name": "create tables at start",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "once": true,
+        "onceDelay": "1",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 260,
+        "y": 520,
+        "wires": [
+            [
+                "ct1"
+            ]
+        ]
+    },
+    {
+        "id": "ct1",
+        "type": "sqlite",
+        "z": "tab_main",
+        "mydb": "db",
+        "sqlquery": "fixed",
+        "sql": "CREATE TABLE IF NOT EXISTS readings (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, rx TEXT, module TEXT, building TEXT, zone TEXT, device TEXT, metric TEXT, value REAL, unit TEXT, status TEXT, source TEXT);",
+        "name": "create readings",
+        "x": 480,
+        "y": 440,
+        "wires": [
+            [
+                "ct2"
+            ]
+        ]
+    },
+    {
+        "id": "ct2",
+        "type": "sqlite",
+        "z": "tab_main",
+        "mydb": "db",
+        "sqlquery": "fixed",
+        "sql": "CREATE TABLE IF NOT EXISTS rejects (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, topic TEXT, reason TEXT, raw TEXT);",
+        "name": "create rejects",
+        "x": 680,
+        "y": 400,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "dbg",
+        "type": "debug",
+        "z": "tab_main",
+        "name": "rejects debug",
+        "active": true,
+        "tosidebar": true,
+        "complete": "params",
+        "x": 900,
+        "y": 300,
+        "wires": []
+    }
+]

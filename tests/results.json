@@ -1,0 +1,191 @@
+{
+  "started": "2026-11-16T00:12:21",
+  "finished": "2026-11-16T00:14:27",
+  "passed": 25,
+  "failed": 0,
+  "not_run": 1,
+  "results": [
+    {
+      "id": "U1",
+      "name": "Logic unit tests (fake clock)",
+      "expected": "all tests pass",
+      "actual": "11 tests passed",
+      "result": "PASS"
+    },
+    {
+      "id": "T1",
+      "name": "Valid feed accepted and shown",
+      "expected": "Reading visible via API within 5 s",
+      "actual": "visible after 0.02 s",
+      "result": "PASS"
+    },
+    {
+      "id": "T2",
+      "name": "Missing required field rejected",
+      "expected": "Stored in rejects with reason missing_field:device_id",
+      "actual": "reason=missing_field:device_id",
+      "result": "PASS"
+    },
+    {
+      "id": "T2b",
+      "name": "Malformed JSON flagged",
+      "expected": "Stored in rejects with reason malformed_json",
+      "actual": "reason=malformed_json",
+      "result": "PASS"
+    },
+    {
+      "id": "T2c",
+      "name": "Invalid timestamp flagged",
+      "expected": "Stored in rejects with reason invalid_timestamp",
+      "actual": "reason=invalid_timestamp",
+      "result": "PASS"
+    },
+    {
+      "id": "T2d",
+      "name": "Out-of-range value flagged",
+      "expected": "Stored in rejects with reason out_of_range:power_w",
+      "actual": "reason=out_of_range:power_w",
+      "result": "PASS"
+    },
+    {
+      "id": "T3",
+      "name": "Unknown device flagged",
+      "expected": "Stored in rejects with reason unknown_device:GHOST-99",
+      "actual": "reason=unknown_device:GHOST-99",
+      "result": "PASS"
+    },
+    {
+      "id": "T3b",
+      "name": "Unknown module flagged",
+      "expected": "Stored in rejects with reason unknown_module:cafeteria",
+      "actual": "reason=unknown_module:cafeteria",
+      "result": "PASS"
+    },
+    {
+      "id": "T2e",
+      "name": "Rejected messages never reach readings",
+      "expected": "Latest value untouched by the 6 bad messages",
+      "actual": "latest unchanged",
+      "result": "PASS"
+    },
+    {
+      "id": "T4",
+      "name": "Device silent > timeout becomes stale/offline + alert",
+      "expected": "health=stale after offline_s=10 s, device_offline alert raised",
+      "actual": "online first=True; stale after 10.8 s; alert=raised",
+      "result": "PASS"
+    },
+    {
+      "id": "T4b",
+      "name": "Data resumes -> back online, offline alert clears",
+      "expected": "health=online and alert cleared (<=10 s timer)",
+      "actual": "recovered after 10.3 s",
+      "result": "PASS"
+    },
+    {
+      "id": "T6",
+      "name": "Alert correct: severity/value, de-dup, ack, clear",
+      "expected": "1 row (2 identical events), active -> acknowledged -> cleared",
+      "actual": "rows=1, first=active, ack http=200, after ack=acknowledged, after clear=cleared",
+      "result": "PASS"
+    },
+    {
+      "id": "T7",
+      "name": "Units and last-updated time shown",
+      "expected": "metric has unit + received time; page renders 'x s ago' and SIMULATED label",
+      "actual": "unit=W, rx=2026-11-15T18:42:21.267Z, page labels present=True",
+      "result": "PASS"
+    },
+    {
+      "id": "R1",
+      "name": "Role check on acknowledge",
+      "expected": "viewer 403, operator 200",
+      "actual": "viewer 403, operator 200",
+      "result": "PASS"
+    },
+    {
+      "id": "R2",
+      "name": "CSV export (administrator only, filtered)",
+      "expected": "operator 403; admin 200, header + data rows, only energy",
+      "actual": "operator 403, admin 200, 28 lines, header ok=True, all energy=True",
+      "result": "PASS"
+    },
+    {
+      "id": "F1",
+      "name": "Filters by module / building / zone",
+      "expected": "only matching devices returned",
+      "actual": "module=energy->{'energy'}, BLOCK-B->{'BLOCK-B'}, LOT-1->{'LOT-1'} x4",
+      "result": "PASS"
+    },
+    {
+      "id": "S1",
+      "name": "Filter input is not injectable",
+      "expected": "treated as 'no filter', no error, 9 registered devices",
+      "actual": "9 devices returned",
+      "result": "PASS"
+    },
+    {
+      "id": "M1",
+      "name": "Normal: occupied + dark -> light ON, fan OFF",
+      "expected": "occupied, daylight keeps light OFF; darkness turns light ON",
+      "actual": "bright: occ=True light=False; dark -> light ON after 0.9 s; fan=False",
+      "result": "PASS"
+    },
+    {
+      "id": "M2",
+      "name": "Threshold: 31.5 C occupied -> fan ON + alert",
+      "expected": "fan ON, high_temperature alert active",
+      "actual": "fan ON after 2.1 s; alert=raised",
+      "result": "PASS"
+    },
+    {
+      "id": "M3",
+      "name": "Boundary: hysteresis at 30.0 / 30.1 / 27.0 / 26.9 C",
+      "expected": "fan flips only above 30 C and below 27 C",
+      "actual": "30.0C->ON, 27.0C->ON, 26.9C->OFF, 30.0C->OFF, 30.1C->ON",
+      "result": "PASS"
+    },
+    {
+      "id": "M4",
+      "name": "Sensor disconnect: 3 bad reads -> fail-safe",
+      "expected": "fan forced OFF, sensor_fault true, sensor_failure alert",
+      "actual": "fail-safe after 5.4 s; fan=False; alert=raised",
+      "result": "PASS"
+    },
+    {
+      "id": "M5",
+      "name": "Recovery: sensor returns -> alert clears, logic resumes",
+      "expected": "sensor_fault false, alert cleared",
+      "actual": "recovered after 6.8 s",
+      "result": "PASS"
+    },
+    {
+      "id": "M6",
+      "name": "Vacancy: no motion 30 s -> light OFF (stationary occupant limitation)",
+      "expected": "still occupied at +20 s; vacant and light OFF by ~30 s",
+      "actual": "at +20 s occupied=True; vacant+light OFF after a further 10.4 s",
+      "result": "PASS"
+    },
+    {
+      "id": "M7",
+      "name": "False trigger: single PIR pulse ignored",
+      "expected": "room stays vacant, light stays OFF",
+      "actual": "occupied=False, light_on=False",
+      "result": "PASS"
+    },
+    {
+      "id": "T5a",
+      "name": "Device killed (last will) then restarted: resumes",
+      "expected": "offline + alert after kill; online again and alert cleared after restart",
+      "actual": "offline=True, alert=raised, back online after 0.4 s, alert cleared after 9.7 s",
+      "result": "PASS"
+    },
+    {
+      "id": "T5b",
+      "name": "Broker outage: stop/start Mosquitto, all parties reconnect",
+      "expected": "Node-RED + device resume without restart",
+      "actual": "NOT RUN: needs admin to stop the Mosquitto service; do it by hand (docs/phase8_validation.md)",
+      "result": "NOT RUN"
+    }
+  ]
+}

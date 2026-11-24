@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CHRIST Smart Campus Demo</title>
+<style>
+  :root {
+    --bg:#f6f7f9; --card:#ffffff; --ink:#1b2430; --muted:#5d6b7c; --line:#d9dee5; --accent:#1f5fbf;
+    --ok:#17794a; --okbg:#dff3e8; --warn:#8a5a00; --warnbg:#fdf0cf; --bad:#a3262a; --badbg:#fbdedf;
+    --off:#4d5866; --offbg:#e6e9ed; --sim:#6b3fa0; --simbg:#eee4f8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#12171d; --card:#1b232c; --ink:#e6ebf0; --muted:#9aa8b8; --line:#2f3b48; --accent:#6aa5ff;
+      --ok:#6fd6a0; --okbg:#173a2a; --warn:#f0c24f; --warnbg:#3d3010; --bad:#ff8f93; --badbg:#431b1d;
+      --off:#b3bdc9; --offbg:#2a343f; --sim:#c7a4f0; --simbg:#32204a;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,Segoe UI,Roboto,sans-serif; }
+  header { padding:12px 16px; background:var(--card); border-bottom:1px solid var(--line); }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .banner { font-size:13px; color:var(--sim); background:var(--simbg); padding:4px 10px; border-radius:6px; display:inline-block; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:8px; }
+  main { padding:12px 16px 40px; max-width:1200px; margin:0 auto; }
+  label { font-size:13px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+  select, input, button { font:inherit; color:var(--ink); background:var(--card); border:1px solid var(--line); border-radius:6px; padding:5px 8px; }
+  button { cursor:pointer; } button:disabled { opacity:.5; cursor:not-allowed; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  nav { display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }
+  nav button[aria-selected="true"] { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:10px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .card h3 { margin:0 0 6px; font-size:15px; text-transform:capitalize; }
+  .big { font-size:26px; font-weight:600; }
+  .muted { color:var(--muted); font-size:13px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; font-weight:600; white-space:nowrap; }
+  .p-online,.p-cleared { background:var(--okbg); color:var(--ok); }
+  .p-stale,.p-warning,.p-acknowledged { background:var(--warnbg); color:var(--warn); }
+  .p-offline,.p-critical,.p-active { background:var(--badbg); color:var(--bad); }
+  .p-no_data,.p-info { background:var(--offbg); color:var(--off); }
+  .p-sim { background:var(--simbg); color:var(--sim); }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); font-size:14px; vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
+  .scroll { overflow-x:auto; }
+  tr.click { cursor:pointer; } tr.click:hover { background:var(--offbg); }
+  h2 { font-size:16px; margin:18px 0 8px; }
+  #conn { font-size:13px; } .bad { color:var(--bad); font-weight:600; }
+  .stale-data { opacity:.55; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CHRIST Smart Campus &mdash; Integrated IoT Demo</h1>
+  <span class="banner">Educational prototype &middot; isolated lab network &middot; all data is SIMULATED &middot; roles are simulated (not real login)</span>
+  <div class="row">
+    <label>Role (simulated)
+      <select id="role"><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="administrator">Administrator</option></select>
+    </label>
+    <label>Module <select id="fModule"></select></label>
+    <label>Building <select id="fBuilding"></select></label>
+    <label>Zone <select id="fZone"></select></label>
+    <button id="fReset">Reset filters</button>
+    <span id="conn" role="status" aria-live="polite">connecting&hellip;</span>
+  </div>
+</header>
+<main>
+  <nav role="tablist" id="nav"></nav>
+  <section id="v-overview"></section>
+  <section id="v-buildings" hidden></section>
+  <section id="v-module" hidden></section>
+  <section id="v-alerts" hidden></section>
+  <section id="v-device" hidden></section>
+  <section id="v-admin" hidden></section>
+</main>
+<script>
+"use strict";
+const MODULES = ["classroom","parking","energy","water","waste","safety"];
+const VIEWS = [["overview","Campus overview"],["buildings","Building / zone"],["module","Module page"],
+               ["alerts","Alerts"],["device","Device details"],["admin","Admin / export"]];
+const NAMES = {occupancy_detected:"Occupancy", occupancy_count:"Occupants", temperature:"Temperature", light_level:"Light level",
+  co2_ppm:"CO2", slot_occupied:"Slot occupied", power_w:"Power", energy_kwh:"Energy", tank_level_pct:"Tank level",
+  water_flow_lpm:"Water flow", bin_fill_pct:"Bin fill", smoke_detected:"Smoke detected", device_online:"Device online"};
+const S = {role:"viewer", view:"overview", module:"classroom", device:null, full:null, data:null, alerts:[], readings:[],
+          rejects:[], cfg:null, ok:false, lastOk:0, filters:{module:"",building:"",zone:""}};
+try { const r = localStorage.getItem("role"); if (r) S.role = r; } catch (e) {}
+// Deep links for demos/evidence: /campus#alerts, /campus#device:CLASS-A-ESP32-01, /campus#module:water
+{ const [v, arg] = location.hash.slice(1).split(":");
+  if (VIEWS.some(x => x[0] === v)) S.view = v;
+  if (v === "device" && arg) S.device = arg;
+  if (v === "module" && MODULES.includes(arg)) S.module = arg; }
+
+// ---- tiny DOM helper (no innerHTML => no injection from device-supplied text) ------------
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return e;
+}
+const $ = id => document.getElementById(id);
+const pill = (cls, text) => h("span", {class: "pill p-" + cls}, text);
+function fmtVal(m) {
+  if (m.unit === "bool") return m.value ? "Yes" : "No";
+  const u = {C:"°C", pct:"%"}[m.unit] || m.unit;
+  return (Math.round(m.value * 10) / 10) + (u ? " " + u : "");
+}
+function ago(iso) {
+  if (!iso) return "never";
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  return s < 90 ? s + " s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago";
+}
+const clock = iso => iso ? new Date(iso).toLocaleTimeString() : "-";
+const HEALTH = {online:"Online", stale:"Stale (no heartbeat)", offline:"Offline", no_data:"No data yet"};
+
+// ---- API ---------------------------------------------------------------------------------
+async function api(path, opt) {
+  opt = opt || {}; opt.headers = Object.assign({"X-Role": S.role}, opt.headers || {});
+  const r = await fetch("/api" + path, opt);
+  if (!r.ok) { const e = new Error("HTTP " + r.status); e.status = r.status; throw e; }
+  return r;
+}
+const qs = () => { const p = new URLSearchParams(); for (const [k, v] of Object.entries(S.filters)) if (v) p.set(k, v); return p.toString(); };
+
+async function refresh() {
+  try {
+    const q = qs();
+    const [full, data, alerts] = await Promise.all([
+      api("/overview").then(r => r.json()),
+      q ? api("/overview?" + q).then(r => r.json()) : null,
+      api("/alerts?state=all" + (q ? "&" + q : "")).then(r => r.json())]);
+    S.full = full; S.data = data || full; S.alerts = alerts;
+    if (S.view === "device" && S.device) S.readings = await api("/device/" + encodeURIComponent(S.device) + "/readings").then(r => r.json());
+    if (S.view === "admin") {
+      S.rejects = await api("/rejects").then(r => r.json());
+      S.cfg = await api("/config").then(r => r.json());
+    }
+    S.ok = true; S.lastOk = Date.now();
+  } catch (e) { S.ok = false; }
+  render();
+}
+
+// ---- Rendering ---------------------------------------------------------------------------
+function setOptions(sel, values, label, current) {
+  const want = [""].concat(values);
+  if (sel.dataset.sig !== want.join("|")) {
+    sel.replaceChildren(...want.map(v => h("option", {value: v}, v || label)));
+    sel.dataset.sig = want.join("|");
+  }
+  sel.value = current;
+}
+function renderFilters() {
+  const devs = (S.full || {devices: []}).devices;
+  const f = S.filters;
+  setOptions($("fModule"), MODULES, "All modules", f.module);
+  setOptions($("fBuilding"), [...new Set(devs.map(d => d.building))].sort(), "All buildings", f.building);
+  setOptions($("fZone"), [...new Set(devs.filter(d => !f.building || d.building === f.building).map(d => d.zone))].sort(), "All zones", f.zone);
+}
+function render() {
+  const conn = $("conn");
+  conn.className = S.ok ? "" : "bad";
+  conn.textContent = S.ok ? "Live · updated " + new Date(S.lastOk).toLocaleTimeString()
+                          : "Backend unreachable — retrying (showing last data)";
+  $("role").value = S.role;
+  renderFilters();
+  VIEWS.forEach(([id]) => { $("v-" + id).hidden = id !== S.view; });
+  document.querySelectorAll("#nav button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.v === S.view)));
+  const sec = $("v-" + S.view);
+  sec.classList.toggle("stale-data", !S.ok);
+  if (!S.data) return;
+  const ae = document.activeElement;      // don't rebuild the page while someone is typing in a field
+  if (ae && ae.tagName === "INPUT" && sec.contains(ae)) return;
+  const fn = {overview, buildings, module: modulePage, alerts: alertsPage, device: devicePage, admin: adminPage}[S.view];
+  const y = window.scrollY; sec.replaceChildren(...fn()); window.scrollTo(0, y);
+}
+const devs = () => S.data.devices;
+const openDevice = id => { S.device = id; S.view = "device"; S.readings = []; refresh(); };
+const activeAlerts = () => S.alerts.filter(a => a.state === "active");
+
+function overview() {
+  const d = devs(), n = k => d.filter(x => x.health === k).length;
+  const tile = (t, v) => h("div", {class: "card"}, h("div", {class: "muted"}, t), h("div", {class: "big"}, v));
+  const cards = MODULES.filter(m => !S.filters.module || m === S.filters.module).map(m => {
+    const md = d.filter(x => x.module === m);
+    const al = activeAlerts().filter(a => a.module === m).length;
+    const best = md.flatMap(x => x.metrics).slice(0, 3);
+    return h("div", {class: "card"},
+      h("h3", {}, m),
+      md.length ? h("div", {}, pill(md.every(x => x.health === "online") ? "online" : md.some(x => x.health === "online") ? "stale" : "no_data",
+        md.filter(x => x.health === "online").length + "/" + md.length + " online"), " ", al ? pill("active", al + " active alert" + (al > 1 ? "s" : "")) : null)
+         : h("div", {class: "muted"}, "no devices match filters"),
+      h("div", {class: "muted", style: "margin-top:6px"}, best.length ? best.map(x => h("div", {}, (NAMES[x.metric] || x.metric) + ": " + fmtVal(x))) : "No data yet"),
+      md.some(x => x.source === "simulated") ? h("div", {style: "margin-top:6px"}, pill("sim", "SIMULATED")) : null,
+      h("div", {style: "margin-top:8px"}, h("button", {onclick: () => { S.module = m; S.view = "module"; render(); }}, "Open " + m)));
+  });
+  return [h("div", {class: "grid"}, tile("Devices", d.length), tile("Online", n("online")), tile("Stale / offline", n("stale") + n("offline")),
+          tile("Active alerts", activeAlerts().length)), h("h2", {}, "Modules"), h("div", {class: "grid"}, cards)];
+}
+
+function devRow(x) {
+  return h("tr", {class: "click", onclick: () => openDevice(x.device_id), tabindex: 0,
+                  onkeydown: e => { if (e.key === "Enter") openDevice(x.device_id); }},
+    h("td", {}, x.device_id), h("td", {}, x.module), h("td", {}, pill(x.health, HEALTH[x.health])),
+    h("td", {}, x.metrics.map(m => h("div", {}, (NAMES[m.metric] || m.metric) + ": " + fmtVal(m)))),
+    h("td", {}, ago(x.last_seen)));
+}
+function buildings() {
+  const out = [], by = {};
+  devs().forEach(x => ((by[x.building] = by[x.building] || {})[x.zone] = (by[x.building][x.zone] || []).concat(x)));
+  for (const b of Object.keys(by).sort()) for (const z of Object.keys(by[b]).sort()) {
+    out.push(h("h2", {}, b + " / " + z));
+    out.push(h("div", {class: "scroll"}, h("table", {}, h("thead", {}, h("tr", {}, ["Device","Module","Health","Latest values","Last update"].map(t => h("th", {}, t)))),
+      h("tbody", {}, by[b][z].map(devRow)))));
+  }
+  return out.length ? out : [h("p", {class: "muted"}, "No devices match the filters.")];
+}
+function modulePage() {
+  const sel = h("select", {onchange: e => { S.module = e.target.value; render(); }}, MODULES.map(m => h("option", {value: m, selected: m === S.module}, m)));
+  const md = devs().filter(x => x.module === S.module);
+  const out = [h("label", {}, "Module ", sel)];
+  if (!md.length) out.push(h("p", {class: "muted"}, "No devices for this module under the current filters."));
+  md.forEach(x => {
+    const ex = x.extras || {};
+    const cards = x.metrics.map(m => h("div", {class: "card"}, h("div", {class: "muted"}, NAMES[m.metric] || m.metric),
+      h("div", {class: "big"}, fmtVal(m)), h("div", {class: "muted"}, "updated " + ago(m.rx) + " (" + clock(m.ts) + ")"), pill(m.status === "normal" ? "online" : "warning", m.status)));
+    if (x.module === "classroom" && x.health !== "no_data") {
+      const act = (t, on) => h("div", {class: "card"}, h("div", {class: "muted"}, t), h("div", {class: "big"}, on ? "ON" : "OFF"), h("div", {class: "muted"}, "from heartbeat " + ago(x.last_seen)));
+      cards.push(act("Light (LED)", ex.light_on), act("Fan", ex.fan_on));
+      if (ex.sensor_fault) cards.push(h("div", {class: "card"}, pill("critical", "Temperature sensor fault")));
+    }
+    out.push(h("h2", {}, x.device_id + " · " + x.building + " / " + x.zone + " "), pill(x.health, HEALTH[x.health]), " ",
+      x.source === "simulated" ? pill("sim", "SIMULATED") : null, h("div", {class: "grid", style: "margin-top:8px"}, cards));
+  });
+  return out;
+}
+function alertsPage() {
+  const can = S.role !== "viewer";
+  const ack = async id => { try { await api("/alerts/" + id + "/ack", {method: "POST"}); } catch (e) { alert("Not allowed or failed: " + e.message); } refresh(); };
+  const rows = S.alerts.map(a => h("tr", {},
+    h("td", {}, clock(a.rx)), h("td", {}, pill(a.severity, a.severity)), h("td", {}, a.alert_type), h("td", {}, a.device),
+    h("td", {}, a.building + " / " + a.zone), h("td", {}, a.unit === "bool" ? (a.value ? "yes" : "no") : a.value + " " + a.unit),
+    h("td", {}, pill(a.state, a.state), a.ack_by ? h("div", {class: "muted"}, "by " + a.ack_by + " at " + clock(a.ack_ts)) : null),
+    h("td", {}, a.state === "active" ? h("button", {disabled: !can, title: can ? "" : "Viewer role cannot acknowledge", onclick: () => ack(a.id)}, "Acknowledge") : null)));
+  return [h("h2", {}, "Alerts (" + activeAlerts().length + " active)"),
+    h("div", {class: "scroll"}, h("table", {}, h("thead", {}, h("tr", {}, ["Time","Severity","Type","Device","Location","Value","State",""].map(t => h("th", {}, t)))),
+      h("tbody", {}, rows.length ? rows : h("tr", {}, h("td", {colspan: 8, class: "muted"}, "No alerts."))))),
+    h("p", {class: "muted"}, "Active = needs attention. Acknowledged = someone has seen it but the condition is still raised. Cleared = condition ended.")];
+}
+function devicePage() {
+  const x = (S.full ? S.full.devices : []).find(d => d.device_id === S.device);
+  if (!x) return [h("p", {class: "muted"}, "Pick a device from the Building / zone or Module page.")];
+  const meta = h("div", {class: "card"}, h("h3", {style: "text-transform:none"}, x.device_id),
+    h("div", {}, pill(x.health, HEALTH[x.health]), " ", x.source === "simulated" ? pill("sim", "SIMULATED") : null),
+    h("div", {class: "muted"}, x.module + " · " + x.building + " / " + x.zone),
+    h("div", {class: "muted"}, "Last heard: " + ago(x.last_seen) + (x.last_seen ? " (" + new Date(x.last_seen).toLocaleString() + ")" : "")),
+    Object.keys(x.extras || {}).length ? h("div", {class: "muted"}, Object.entries(x.extras).map(([k, v]) => k + "=" + v).join(", ")) : null);
+  const latest = h("table", {}, h("thead", {}, h("tr", {}, ["Metric","Value","Unit","Status","Device time","Updated"].map(t => h("th", {}, t)))),
+    h("tbody", {}, x.metrics.map(m => h("tr", {}, h("td", {}, m.metric), h("td", {}, m.unit === "bool" ? (m.value ? "true" : "false") : m.value),
+      h("td", {}, m.unit), h("td", {}, m.status), h("td", {}, clock(m.ts)), h("td", {}, ago(m.rx))))));
+  const hist = h("table", {}, h("thead", {}, h("tr", {}, ["Time","Metric","Value","Unit","Status"].map(t => h("th", {}, t)))),
+    h("tbody", {}, S.readings.map(r => h("tr", {}, h("td", {}, clock(r.ts)), h("td", {}, r.metric), h("td", {}, r.unit === "bool" ? (r.value ? "true" : "false") : r.value), h("td", {}, r.unit), h("td", {}, r.status)))));
+  return [meta, h("h2", {}, "Latest values"), h("div", {class: "scroll"}, latest), h("h2", {}, "Recent readings (last 40)"), h("div", {class: "scroll"}, hist)];
+}
+function adminPage() {
+  const admin = S.role === "administrator";
+  const inp = h("input", {type: "number", min: 10, max: 3600, value: S.cfg ? S.cfg.offline_s : 120, disabled: !admin, style: "width:90px", id: "offIn"});
+  const save = async () => {
+    try { await api("/config", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({offline_s: Number($("offIn").value)})}); }
+    catch (e) { alert("Failed: " + e.message); } refresh();
+  };
+  const exp = async () => {
+    try {
+      const q = qs(); const r = await api("/export.csv" + (q ? "?" + q : ""));
+      const a = h("a", {href: URL.createObjectURL(await r.blob()), download: "campus_readings.csv"}); document.body.append(a); a.click(); a.remove();
+    } catch (e) { alert("Export failed: " + e.message); }
+  };
+  return [h("h2", {}, "Settings"),
+    h("p", {}, h("label", {}, "Offline / stale after (seconds) ", inp), " ", h("button", {disabled: !admin, onclick: save, title: admin ? "" : "Administrator only"}, "Save"),
+      h("span", {class: "muted"}, " default 120. Resets to default if the backend restarts.")),
+    h("h2", {}, "Export"), h("button", {class: "primary", disabled: !admin, onclick: exp, title: admin ? "" : "Administrator only"}, "Download readings CSV (current filters)"),
+    h("h2", {}, "Rejected messages (validation log)"),
+    h("div", {class: "scroll"}, h("table", {}, h("thead", {}, h("tr", {}, ["Time","Reason","Topic","Raw payload"].map(t => h("th", {}, t)))),
+      h("tbody", {}, S.rejects.length ? S.rejects.map(r => h("tr", {}, h("td", {}, new Date(r.ts).toLocaleTimeString()), h("td", {}, r.reason), h("td", {}, r.topic), h("td", {}, r.raw)))
+        : h("tr", {}, h("td", {colspan: 4, class: "muted"}, "None")))))];
+}
+
+// ---- Wiring --------------------------------------------------------------------------------
+$("nav").replaceChildren(...VIEWS.map(([id, t]) => h("button", {role: "tab", "data-v": id, onclick: () => { S.view = id; refresh(); }}, t)));
+$("role").addEventListener("change", e => { S.role = e.target.value; try { localStorage.setItem("role", S.role); } catch (x) {} refresh(); });
+$("fModule").addEventListener("change", e => { S.filters.module = e.target.value; refresh(); });
+$("fBuilding").addEventListener("change", e => { S.filters.building = e.target.value; S.filters.zone = ""; refresh(); });
+$("fZone").addEventListener("change", e => { S.filters.zone = e.target.value; refresh(); });
+$("fReset").addEventListener("click", () => { S.filters = {module: "", building: "", zone: ""}; refresh(); });
+refresh();
+setInterval(refresh, 2000);          // poll every 2 s => updates visible well within the 5 s requirement
+setInterval(() => { if (S.data) render(); }, 1000);   // keep "x s ago" labels ticking
+</script>
+</body>
+</html>

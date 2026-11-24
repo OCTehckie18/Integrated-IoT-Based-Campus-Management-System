@@ -1,0 +1,9 @@
+.env
+secrets.h
+data/*.db
+node_modules/
+# Node-RED runtime files (userDir = project root)
+.config.*
+.flows.json.backup
+flows_cred.json
+package.json
